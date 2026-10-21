@@ -206,15 +206,20 @@ def is_admin(user_id):
 def is_root(user_id):
     return bool(ROOT_ADMIN_ID) and str(user_id) == ROOT_ADMIN_ID
 
-def register_user(user):
+def register_user_and_check_new(user):
     if not user:
-        return
+        return False
+    is_new = False
     with db() as conn:
+        row = conn.execute("SELECT 1 FROM bot_users WHERE user_id=?", (str(user.id),)).fetchone()
+        if not row:
+            is_new = True
         conn.execute("""INSERT INTO bot_users(user_id,username,first_name,last_seen)
             VALUES(?,?,?,CURRENT_TIMESTAMP)
             ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,
             first_name=excluded.first_name,last_seen=CURRENT_TIMESTAMP""",
             (str(user.id), user.username or "", user.first_name or ""))
+    return is_new
 
 def get_node(node_id):
     with db() as conn:
@@ -255,8 +260,22 @@ def admin_only(update: Update):
 # أوامر ومعالجات البوت
 # ------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user:
-        register_user(update.effective_user)
+    user = update.effective_user
+    if user:
+        is_new = register_user_and_check_new(user)
+        if is_new and ROOT_ADMIN_ID:
+            username_str = f"@{user.username}" if user.username else "بدون يوزر"
+            msg = (
+                f"👤 **مستخدم جديد دخل البوت!**\n\n"
+                f"• الاسم: {user.first_name}\n"
+                f"• اليوزر: {username_str}\n"
+                f"• الآيدي: `{user.id}`"
+            )
+            try:
+                await context.bot.send_message(chat_id=int(ROOT_ADMIN_ID), text=msg, parse_mode="Markdown")
+            except Exception as e:
+                log.warning(f"Failed to send new user notification: {e}")
+
     context.user_data.pop("current_node_id", None)
     await update.effective_message.reply_text(
         "🏠 القائمة الرئيسية\n\nاختر القسم المطلوب:",
@@ -315,8 +334,10 @@ async def student_text_navigation(update: Update, context: ContextTypes.DEFAULT_
     if not update.message or not update.message.text:
         return
     text = update.message.text.strip()
-    if update.effective_user:
-        register_user(update.effective_user)
+    user = update.effective_user
+    if user:
+        register_user_and_check_new(user)
+
     if text == "🏠 القائمة الرئيسية":
         await start(update, context)
         return
@@ -348,6 +369,7 @@ def admin_home_keyboard():
         [InlineKeyboardButton("🧩 إدارة جميع الأزرار", callback_data="a:nodes:0")],
         [InlineKeyboardButton("➕ إضافة زر رئيسي", callback_data="a:addroot")],
         [InlineKeyboardButton("📎 إدارة المحتوى", callback_data="a:contentroot")],
+        [InlineKeyboardButton("👥 عرض جميع المشتركين", callback_data="a:listusers")],
         [InlineKeyboardButton("👥 إدارة المشرفين", callback_data="a:admins")],
         [InlineKeyboardButton("📊 الإحصائيات", callback_data="a:stats"), InlineKeyboardButton("📢 إذاعة", callback_data="a:broadcast")],
         [InlineKeyboardButton("🏠 القائمة الرئيسية للطلاب", callback_data="a:studenthome")],
@@ -384,7 +406,7 @@ async def edit_node_screen(query, node_id):
         [InlineKeyboardButton("🧭 تغيير نوع الزر", callback_data=f"a:type:{node_id}")],
         [InlineKeyboardButton("🔗 تعيين رابط", callback_data=f"a:setlink:{node_id}")],
         [InlineKeyboardButton("📝 تعيين نص عند الفتح", callback_data=f"a:settext:{node_id}")],
-        [InlineKeyboardButton("📂 عرض الأزرار الفرعية", callback_data=f"a:nodes:{node_id}")], # <-- تم إضافة هذا الزر لحل المشكلة الأولى
+        [InlineKeyboardButton("📂 عرض الأزرار الفرعية", callback_data=f"a:nodes:{node_id}")],
         [InlineKeyboardButton("➕ إضافة زر فرعي", callback_data=f"a:addchild:{node_id}")],
         [InlineKeyboardButton("📎 إضافة محتوى", callback_data=f"a:addcontent:{node_id}")],
         [InlineKeyboardButton("📚 إدارة محتويات الزر", callback_data=f"a:contents:{node_id}")],
@@ -418,13 +440,41 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "studenthome":
         context.user_data.pop("current_node_id", None)
         await q.edit_message_text("القائمة الرئيسية للطلاب تظهر من أمر /start.\n\nلوحة الإدارة:", reply_markup=admin_home_keyboard())
-    elif action == "contentroot": # <-- تم إضافة معالج ل زر إدارة المحتوى (المشكلة الثانية)
+    elif action == "contentroot":
         await q.edit_message_text(
             "📎 إدارة المحتوى:\n\nلإضافة أو تعديل محتويات أي قسم أو مادة (ملازم، فيديوهات، روابط)، اذهب إلى:\n🧩 إدارة جميع الأزرار -> اختر القسم المطلوب -> ثم اختر 'إضافة محتوى' أو 'إدارة محتويات الزر'.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🧩 الذهاب لإدارة الأزرار", callback_data="a:nodes:0")],
                 [InlineKeyboardButton("🔙 لوحة الإدارة", callback_data="a:home")]
             ])
+        )
+    elif action == "listusers":
+        with db() as conn:
+            users = conn.execute("SELECT user_id, username, first_name, last_seen FROM bot_users ORDER BY last_seen DESC").fetchall()
+        
+        total = len(users)
+        text = f"👥 **قائمة جميع المشتركين في البوت (الإجمالي: {total}):**\n\n"
+        
+        user_lines = []
+        for i, u in enumerate(users, 1):
+            uname = f"@{u['username']}" if u['username'] else "بدون يوزر"
+            fname = u['first_name'] or "مستخدم"
+            uid = u['user_id']
+            user_lines.append(f"{i}. {fname} | {uname} | `{uid}`")
+        
+        full_text = text + "\n".join(user_lines)
+        
+        # حماية ضد تجاوز الحد الأقصى لطول الرسالة في تليجرام (4096 حرف)
+        if len(full_text) > 4000:
+            full_text = text + "\n".join(user_lines[:120]) + f"\n\n... و {len(user_lines) - 120} مستخدمين آخرين."
+        
+        if not users:
+            full_text = "👥 لا يوجد مشتركين في البوت حتى الآن."
+            
+        await q.edit_message_text(
+            full_text, 
+            parse_mode="Markdown", 
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 لوحة الإدارة", callback_data="a:home")]])
         )
     elif action == "nodes":
         parent_id = int(parts[2]) if len(parts) > 2 else 0
@@ -626,7 +676,7 @@ async def admin_pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif op == "set_value":
         node_id, kind = pending["node_id"], pending["type"]
         if kind == "link" and not (text.startswith("https://") or text.startswith("http://")):
-            await message.reply_text("الرابط غير صالح. أرسله كاملًا ويبدأ بـ https:// أو http://")
+            await message.reply_text("الرابط غير صالح. أرسلهم كاملًا ويبدأ بـ https:// أو http://")
             return
         with db() as conn:
             conn.execute("UPDATE menu_nodes SET action_type=?, action_value=? WHERE id=?", (kind, text, node_id))
@@ -712,13 +762,9 @@ async def main():
     if not ROOT_ADMIN_ID or not ROOT_ADMIN_ID.isdigit():
         raise RuntimeError("ضع ID الرقمي للأدمن الرئيسي في متغير البيئة ADMIN_ID.")
     
-    # 1. تهيئة قاعدة البيانات
     init_db()
-
-    # 2. تشغيل سيرفر الويب المصغر لمنع وضع خمول Render
     await start_web_server()
 
-    # 3. إعداد وتطبيق البوت
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_command))
