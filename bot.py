@@ -313,7 +313,7 @@ async def student_text_navigation(update: Update, context: ContextTypes.DEFAULT_
         return
     await show_node(update, context, matches[0])
 
-# -------------------------- لوحة الإدارة بتصميم فاخر --------------------------
+# -------------------------- لوحة الإدارة --------------------------
 def admin_home_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🧩 إدارة جميع الأقسام والأزرار", callback_data="a:nodes:0")],
@@ -774,7 +774,9 @@ async def main():
     log.info("Starting Cyber Library bot with Supabase PostgreSQL...")
     await app.initialize()
     await app.start()
-    app.updater.start_polling(drop_pending_updates=False)
+    
+    # التعديل المهم هنا: تم إضافة await قبل عملية start_polling
+    await app.updater.start_polling(drop_pending_updates=False)
 
     try:
         await asyncio.Event().wait()
