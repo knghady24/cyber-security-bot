@@ -2,7 +2,7 @@ import os
 import sqlite3
 import asyncio
 from aiohttp import web
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, Update
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, 
     MessageHandler, ContextTypes, ConversationHandler, filters
@@ -44,16 +44,17 @@ def init_db():
             category_name TEXT
         )
     ''')
-    # جدول المشرفين (الأدمنية الإضافيين)
+    # جدول المشرفين (يدعم ID أو Username)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS admins (
-            user_id TEXT UNIQUE
+            admin_identifier TEXT UNIQUE
         )
     ''')
     # جدول الطلاب/المستخدمين لتتبع الإذاعة والإحصائيات
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS bot_users (
-            user_id TEXT UNIQUE
+            user_id TEXT UNIQUE,
+            username TEXT
         )
     ''')
     conn.commit()
@@ -62,24 +63,28 @@ def init_db():
 init_db()
 
 # دالة للتحقق هل المستخدم أدمن؟
-def is_user_admin(user_id):
+def is_user_admin(user_id, username=None):
     str_id = str(user_id)
+    clean_username = f"@{username.replace('@', '')}" if username else ""
+
     if DEFAULT_ADMIN_ID and str_id == str(DEFAULT_ADMIN_ID):
         return True
     
     conn = sqlite3.connect('cyber_study.db')
     cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM admins WHERE user_id = ?", (str_id,))
+    cursor.execute("SELECT 1 FROM admins WHERE admin_identifier = ? OR (admin_identifier = ? AND admin_identifier != '')", 
+                   (str_id, clean_username))
     res = cursor.fetchone()
     conn.close()
     return res is not None
 
 # دالة لتسجيل المستخدمين الجدد
-def register_user(user_id):
+def register_user(user_id, username=None):
     try:
         conn = sqlite3.connect('cyber_study.db')
         cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO bot_users (user_id) VALUES (?)", (str(user_id),))
+        uname = f"@{username}" if username else ""
+        cursor.execute("INSERT OR REPLACE INTO bot_users (user_id, username) VALUES (?, ?)", (str(user_id), uname))
         conn.commit()
         conn.close()
     except:
@@ -89,7 +94,7 @@ def register_user(user_id):
 ADD_SUB_TERM, ADD_SUB_NAME = range(2)
 CONT_SUB, CONT_CAT, CONT_TITLE, CONT_URL = range(2, 6)
 ADD_CAT_SUB, ADD_CAT_NAME = range(6, 8)
-ADD_ADMIN_ID = range(8, 9)
+ADD_ADMIN_INPUT = range(8, 9)
 BROADCAST_MSG = range(9, 10)
 
 # ----------------------------------------------------
@@ -109,48 +114,46 @@ async def start_web_server():
     await site.start()
 
 # ----------------------------------------------------
-# 3. واجهة الطلاب وتصفح الأزرار
+# 3. واجهة الطلاب (أزرار الكيبورد الثابتة)
 # ----------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    register_user(user_id)
+    user = update.effective_user
+    register_user(user.id, user.username)
 
     keyboard = [
-        [InlineKeyboardButton("🛡️ تخصص الأمن السيبراني", callback_data='dept_cyber')],
-        [InlineKeyboardButton("📢 قناة الدفعة", url='https://t.me/telegram')]
+        [KeyboardButton("🛡️ تخصص الأمن السيبراني")],
+        [KeyboardButton("📢 قناة الدفعة")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    text = "👋 أهلاً بك في بوت المكتبة الأكاديمية!\n\nاختر التخصص للوصول إلى المواد والملازم:"
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    text = "👋 أهلاً بك في بوت المكتبة الأكاديمية!\n\nاختر من الكيبورد أدناه للوصول إلى المواد والملازم:"
     
     if update.message:
         await update.message.reply_text(text, reply_markup=reply_markup)
-    elif update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
 
-async def student_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
+async def student_text_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user = update.effective_user
+    register_user(user.id, user.username)
 
-    if data == 'dept_cyber':
+    # 1. القائمة الرئيسية / التخصصات
+    if text in ["🛡️ تخصص الأمن السيبراني", "🔙 رجوع للتخصصات"]:
         keyboard = [
-            [InlineKeyboardButton("🎓 سنة ثالثة", callback_data='year_third')],
-            [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data='main_menu')]
+            [KeyboardButton("🎓 سنة ثالثة")],
+            [KeyboardButton("🏠 القائمة الرئيسية")]
         ]
-        await query.edit_message_text("🛡️ **تخصص الأمن السيبراني**\n\nاختر السنة الدراسية:", 
-                                     reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        await update.message.reply_text("🛡️ **تخصص الأمن السيبراني**\n\nاختر السنة الدراسية:", reply_markup=reply_markup, parse_mode='Markdown')
 
-    elif data == 'year_third':
+    elif text == "🎓 سنة ثالثة" or text == "🔙 رجوع للفصول":
         keyboard = [
-            [InlineKeyboardButton("📖 الفصل الأول", callback_data='term_1')],
-            [InlineKeyboardButton("📖 الفصل الثاني", callback_data='term_2')],
-            [InlineKeyboardButton("🔙 رجوع للتخصصات", callback_data='dept_cyber')]
+            [KeyboardButton("📖 الفصل الأول"), KeyboardButton("📖 الفصل الثاني")],
+            [KeyboardButton("🔙 رجوع للتخصصات")]
         ]
-        await query.edit_message_text("🎓 **سنة ثالثة**\n\nاختر الفصل الدراسي:", 
-                                     reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        await update.message.reply_text("🎓 **سنة ثالثة**\n\nاختر الفصل الدراسي:", reply_markup=reply_markup, parse_mode='Markdown')
 
-    elif data in ['term_1', 'term_2']:
-        term_name = "الفصل الأول" if data == 'term_1' else "الفصل الثاني"
+    elif text in ["📖 الفصل الأول", "📖 الفصل الثاني"]:
+        term_name = "الفصل الأول" if text == "📖 الفصل الأول" else "الفصل الثاني"
         year_name = "سنة ثالثة"
         
         conn = sqlite3.connect('cyber_study.db')
@@ -161,9 +164,10 @@ async def student_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         keyboard = []
         for sub_id, sub_name in subjects:
-            keyboard.append([InlineKeyboardButton(f"📘 {sub_name}", callback_data=f"show_sub_{sub_id}")])
+            keyboard.append([KeyboardButton(f"📘 {sub_name}")])
         
-        keyboard.append([InlineKeyboardButton("🔙 رجوع للفصول", callback_data='year_third')])
+        keyboard.append([KeyboardButton("🔙 رجوع للفصول")])
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
         msg = f"📚 **مواد {year_name} - {term_name}:**\n\n"
         if not subjects:
@@ -171,68 +175,81 @@ async def student_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             msg += "اختر المادة لعرض محتوياتها:"
             
-        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
 
-    elif data.startswith('show_sub_'):
-        sub_id = data.split('_')[2]
+    elif text.startswith("📘 "):
+        sub_name_input = text.replace("📘 ", "").strip()
         conn = sqlite3.connect('cyber_study.db')
         cursor = conn.cursor()
-        cursor.execute("SELECT name, term FROM subjects WHERE id = ?", (sub_id,))
+        cursor.execute("SELECT id, term FROM subjects WHERE name = ?", (sub_name_input,))
         sub_info = cursor.fetchone()
-        
-        cursor.execute("SELECT category_name FROM custom_categories WHERE subject_id = ?", (sub_id,))
-        custom_cats = cursor.fetchall()
-        conn.close()
 
         if sub_info:
-            sub_name, sub_term = sub_info
-            term_callback = 'term_1' if sub_term == 'الفصل الأول' else 'term_2'
-            
+            sub_id, sub_term = sub_info
+            cursor.execute("SELECT category_name FROM custom_categories WHERE subject_id = ?", (sub_id,))
+            custom_cats = cursor.fetchall()
+            conn.close()
+
             keyboard = [
-                [InlineKeyboardButton("📄 الملازم والكتب", callback_data=f"cat_{sub_id}_ملازم")],
-                [InlineKeyboardButton("🎥 الفيديوهات والدروس", callback_data=f"cat_{sub_id}_فيديوهات")],
-                [InlineKeyboardButton("📝 امتحانات وأسئلة", callback_data=f"cat_{sub_id}_امتحانات")]
+                [KeyboardButton(f"📄 ملازم - {sub_name_input}"), KeyboardButton(f"🎥 فيديوهات - {sub_name_input}")],
+                [KeyboardButton(f"📝 امتحانات - {sub_name_input}")]
             ]
-            
             for (cat_name,) in custom_cats:
-                keyboard.append([InlineKeyboardButton(f"📌 {cat_name}", callback_data=f"cat_{sub_id}_{cat_name}")])
+                keyboard.append([KeyboardButton(f"📌 {cat_name} - {sub_name_input}")])
 
-            keyboard.append([InlineKeyboardButton("🔙 رجوع للمواد", callback_data=term_callback)])
+            keyboard.append([KeyboardButton(f"🔙 رجوع لمواد {sub_term}")])
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-            await query.edit_message_text(f"📘 **مادة: {sub_name}**\n\nاختر نوع المحتوى الذي تبحث عنه:", 
-                                         reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            await update.message.reply_text(f"📘 **مادة: {sub_name_input}**\n\nاختر نوع المحتوى الذي تبحث عنه:", 
+                                           reply_markup=reply_markup, parse_mode='Markdown')
 
-    elif data.startswith('cat_'):
-        parts = data.split('_', 2)
-        sub_id = parts[1]
-        category = parts[2]
-        
-        conn = sqlite3.connect('cyber_study.db')
-        cursor = conn.cursor()
-        cursor.execute("SELECT title, url FROM contents WHERE subject_id = ? AND category = ?", (sub_id, category))
-        items = cursor.fetchall()
-        conn.close()
+    elif text.startswith("🔙 رجوع لمواد "):
+        term_target = text.replace("🔙 رجوع لمواد ", "").strip()
+        update.message.text = f"📖 {term_target}"
+        await student_text_navigation(update, context)
 
-        text = f"📌 **قسم ({category}):**\n\n"
-        if not items:
-            text += "لا توجد روابط مضافة هنا حالياً."
-        else:
-            for title, url in items:
-                text += f"• [{title}]({url})\n"
+    elif any(text.startswith(prefix) for prefix in ["📄 ملازم - ", "🎥 فيديوهات - ", "📝 امتحانات - ", "📌 "]):
+        try:
+            if " - " in text:
+                cat_part, sub_name = text.split(" - ", 1)
+                category = cat_part.replace("📄 ملازم", "ملازم").replace("🎥 فيديوهات", "فيديوهات").replace("📝 امتحانات", "امتحانات").replace("📌 ", "")
+            else:
+                return
 
-        keyboard = [[InlineKeyboardButton("🔙 رجوع للمادة", callback_data=f"show_sub_{sub_id}")]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), 
-                                     parse_mode='Markdown', disable_web_page_preview=True)
+            conn = sqlite3.connect('cyber_study.db')
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM subjects WHERE name = ?", (sub_name,))
+            sub_row = cursor.fetchone()
 
-    elif data == 'main_menu':
+            if sub_row:
+                sub_id = sub_row[0]
+                cursor.execute("SELECT title, url FROM contents WHERE subject_id = ? AND category = ?", (sub_id, category))
+                items = cursor.fetchall()
+                conn.close()
+
+                text_resp = f"📌 **قسم ({category}) - مادة {sub_name}:**\n\n"
+                if not items:
+                    text_resp += "لا توجد روابط مضافة هنا حالياً."
+                else:
+                    for title, url in items:
+                        text_resp += f"• [{title}]({url})\n"
+
+                await update.message.reply_text(text_resp, parse_mode='Markdown', disable_web_page_preview=True)
+        except Exception as e:
+            pass
+
+    elif text == "🏠 القائمة الرئيسية":
         await start(update, context)
 
+    elif text == "📢 قناة الدفعة":
+        await update.message.reply_text("📢 **قناة الدفعة الرسمية:**\nhttps://t.me/telegram")
+
 # ----------------------------------------------------
-# 4. لوحة تحكم الأدمن الشاملة (/admin)
+# 4. لوحة تحكم الأدمن (أزرار شفافة Inline)
 # ----------------------------------------------------
 async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_user_admin(user_id):
+    user = update.effective_user
+    if not is_user_admin(user.id, user.username):
         if update.message:
             await update.message.reply_text("❌ عذراً، هذا الأمر مخصص لإدارة البوت فقط.")
         return
@@ -272,7 +289,7 @@ async def admin_sub_term_chosen(update: Update, context: ContextTypes.DEFAULT_TY
     return ADD_SUB_NAME
 
 async def admin_sub_name_saved(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sub_name = update.message.text
+    sub_name = update.message.text.strip()
     term = context.user_data['new_sub_term']
     
     conn = sqlite3.connect('cyber_study.db')
@@ -355,7 +372,7 @@ async def admin_cont_title_saved(update: Update, context: ContextTypes.DEFAULT_T
     return CONT_URL
 
 async def admin_cont_url_saved(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text
+    url = update.message.text.strip()
     sub_id = context.user_data['target_sub_id']
     category = context.user_data['target_category']
     title = context.user_data['target_title']
@@ -409,11 +426,11 @@ async def admin_cat_sub_chosen(update: Update, context: ContextTypes.DEFAULT_TYP
     sub_id = query.data.split('_')[1]
     context.user_data['cat_sub_id'] = sub_id
 
-    await query.edit_message_text("اكتب الآن **اسم الزر/القسم الجديد** (مثال: مشاريع العملي، حلقات النقاش):", parse_mode='Markdown')
+    await query.edit_message_text("اكتب الآن **اسم الزر/القسم الجديد** (مثال: مشاريع العملي):", parse_mode='Markdown')
     return ADD_CAT_NAME
 
 async def admin_cat_name_saved(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cat_name = update.message.text
+    cat_name = update.message.text.strip()
     sub_id = context.user_data['cat_sub_id']
 
     conn = sqlite3.connect('cyber_study.db')
@@ -425,26 +442,29 @@ async def admin_cat_name_saved(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(f"✅ تم إضافة زر القسم الجديد **({cat_name})** بنجاح للمادة!", parse_mode='Markdown')
     return ConversationHandler.END
 
-# --- د. إضافة مشرف جديد (Admin ID) ---
+# --- د. إضافة مشرف جديد (يدعم Username أو ID) ---
 async def admin_add_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
         "👥 **إضافة مشرف جديد:**\n\n"
-        "أرسل الآن الـ Telegram ID الخاص بالشخص المراد إضافته كأدمن:",
+        "أرسل الآن **اسم المستخدم (Username)** مثل `@username` أو الـ **Telegram ID** الخاص بالشخص المراد ترقيته لأدمن:",
         parse_mode='Markdown'
     )
-    return ADD_ADMIN_ID
+    return ADD_ADMIN_INPUT
 
 async def admin_add_admin_saved(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    new_admin_id = update.message.text.strip()
+    input_text = update.message.text.strip()
+    if not input_text.startswith("@") and not input_text.isdigit():
+        input_text = f"@{input_text}"
+
     try:
         conn = sqlite3.connect('cyber_study.db')
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO admins (user_id) VALUES (?)", (new_admin_id,))
+        cursor.execute("INSERT INTO admins (admin_identifier) VALUES (?)", (input_text,))
         conn.commit()
         conn.close()
-        await update.message.reply_text(f"✅ تم منح صلاحيات الإدارة بنجاح للأيدي: `{new_admin_id}`", parse_mode='Markdown')
+        await update.message.reply_text(f"✅ تم منح صلاحيات الإدارة بنجاح للمشرف: `{input_text}`", parse_mode='Markdown')
     except sqlite3.IntegrityError:
         await update.message.reply_text("⚠️ هذا المستخدم مسجل كأدمن مسبقاً.")
     except Exception as e:
@@ -512,19 +532,17 @@ async def back_to_admin_handler(update: Update, context: ContextTypes.DEFAULT_TY
     await admin_start(update, context)
 
 # ----------------------------------------------------
-# 5. التشغيل الرئيسي وإعداد المعالجات (متوافق مع Python 3.14)
+# 5. التشغيل الرئيسي وإعداد المعالجات
 # ----------------------------------------------------
 async def main_async():
     if not TOKEN:
         print("خطأ: لم يتم تحديد BOT_TOKEN!")
         return
 
-    # تشغيل سيرفر الويب في الخلفية لخدمة UptimeRobot
     await start_web_server()
 
     app = Application.builder().token(TOKEN).build()
 
-    # محادثة إضافة مادة للأدمن
     add_sub_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_add_sub_start, pattern='^adm_add_sub$')],
         states={
@@ -534,7 +552,6 @@ async def main_async():
         fallbacks=[]
     )
 
-    # محادثة إضافة محتوى (رابط/ملزمة)
     add_cont_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_add_cont_start, pattern='^adm_add_cont$')],
         states={
@@ -549,7 +566,6 @@ async def main_async():
         fallbacks=[]
     )
 
-    # محادثة إضافة قسم/زر جديد للمادة
     add_cat_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_add_cat_start, pattern='^adm_add_cat$')],
         states={
@@ -562,16 +578,14 @@ async def main_async():
         fallbacks=[]
     )
 
-    # محادثة إضافة أدمن جديد
     add_admin_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_add_admin_start, pattern='^adm_add_admin$')],
         states={
-            ADD_ADMIN_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_admin_saved)]
+            ADD_ADMIN_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_admin_saved)]
         },
         fallbacks=[]
     )
 
-    # محادثة الإذاعة العامة
     broadcast_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_broadcast_start, pattern='^adm_broadcast$')],
         states={
@@ -590,14 +604,14 @@ async def main_async():
 
     app.add_handler(CallbackQueryHandler(admin_stats_handler, pattern='^adm_stats$'))
     app.add_handler(CallbackQueryHandler(back_to_admin_handler, pattern='^back_to_admin$'))
-    app.add_handler(CallbackQueryHandler(student_navigation))
+    
+    # معالج التصفح بالكيبورد للطلاب
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, student_text_navigation))
 
-    print("🚀 بوت الأمن السيبراني يعمل بكامل طاقته ومميزاته...")
+    print("🚀 بوت الأمن السيبراني يعمل بأزرار الكيبورد الثابتة وميزة رفع الأدمن باليوزر...")
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
-    
-    # إبقاء البوت قيد التشغيل
     await asyncio.Event().wait()
 
 def main():
