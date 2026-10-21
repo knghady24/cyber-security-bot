@@ -12,7 +12,7 @@ from telegram.ext import (
 # 1. إعداد قاعدة البيانات والاتصال
 # ----------------------------------------------------
 TOKEN = os.environ.get("BOT_TOKEN")
-DEFAULT_ADMIN_ID = os.environ.get("ADMIN_ID") # الأيدي الأساسي من إعدادات Render
+DEFAULT_ADMIN_ID = os.environ.get("ADMIN_ID") # الأدمن الرئيسي صاحب الصلاحيات المطلقة
 
 def init_db():
     conn = sqlite3.connect('cyber_study.db')
@@ -44,13 +44,14 @@ def init_db():
             category_name TEXT
         )
     ''')
-    # جدول المشرفين (يدعم ID أو Username)
+    # جدول المشرفين (يحفظ الـ ID والـ Username)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS admins (
-            admin_identifier TEXT UNIQUE
+            admin_id TEXT UNIQUE,
+            username TEXT
         )
     ''')
-    # جدول الطلاب/المستخدمين لتتبع الإذاعة والإحصائيات
+    # جدول الطلاب والمستخدمين للإذاعة والإحصائيات
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS bot_users (
             user_id TEXT UNIQUE,
@@ -62,23 +63,19 @@ def init_db():
 
 init_db()
 
-# دالة للتحقق هل المستخدم أدمن؟
+# دالة التحقق من صلاحيات الأدمن (الأدمن الأساسي يمتلك صلاحيات مطلقة)
 def is_user_admin(user_id, username=None):
     str_id = str(user_id)
-    clean_username = f"@{username.replace('@', '')}" if username else ""
-
     if DEFAULT_ADMIN_ID and str_id == str(DEFAULT_ADMIN_ID):
         return True
     
     conn = sqlite3.connect('cyber_study.db')
     cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM admins WHERE admin_identifier = ? OR (admin_identifier = ? AND admin_identifier != '')", 
-                   (str_id, clean_username))
+    cursor.execute("SELECT 1 FROM admins WHERE admin_id = ?", (str_id,))
     res = cursor.fetchone()
     conn.close()
     return res is not None
 
-# دالة لتسجيل المستخدمين الجدد
 def register_user(user_id, username=None):
     try:
         conn = sqlite3.connect('cyber_study.db')
@@ -96,6 +93,7 @@ CONT_SUB, CONT_CAT, CONT_TITLE, CONT_URL = range(2, 6)
 ADD_CAT_SUB, ADD_CAT_NAME = range(6, 8)
 ADD_ADMIN_INPUT = range(8, 9)
 BROADCAST_MSG = range(9, 10)
+DEL_SUB_TERM, DEL_SUB_CHOOSE = range(10, 12)
 
 # ----------------------------------------------------
 # 2. سيرفر الويب لمنع وضع النوم (UptimeRobot)
@@ -135,7 +133,6 @@ async def student_text_navigation(update: Update, context: ContextTypes.DEFAULT_
     user = update.effective_user
     register_user(user.id, user.username)
 
-    # 1. القائمة الرئيسية / التخصصات
     if text in ["🛡️ تخصص الأمن السيبراني", "🔙 رجوع للتخصصات"]:
         keyboard = [
             [KeyboardButton("🎓 سنة ثالثة")],
@@ -245,7 +242,7 @@ async def student_text_navigation(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("📢 **قناة الدفعة الرسمية:**\nhttps://t.me/telegram")
 
 # ----------------------------------------------------
-# 4. لوحة تحكم الأدمن (أزرار شفافة Inline)
+# 4. لوحة تحكم الأدمن الشاملة (أزرار شفافة Inline)
 # ----------------------------------------------------
 async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -255,16 +252,16 @@ async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     keyboard = [
-        [InlineKeyboardButton("➕ إضافة مادة جديدة", callback_data='adm_add_sub')],
+        [InlineKeyboardButton("➕ إضافة مادة جديدة", callback_data='adm_add_sub'), InlineKeyboardButton("❌ حذف مادة", callback_data='adm_del_sub')],
         [InlineKeyboardButton("🔗 إضافة رابط/ملزمة", callback_data='adm_add_cont')],
         [InlineKeyboardButton("🗂️ إضافة زر/قسم جديد للمادة", callback_data='adm_add_cat')],
-        [InlineKeyboardButton("👥 إضافة مشرف جديد (Admin)", callback_data='adm_add_admin')],
+        [InlineKeyboardButton("👥 إدارة المشرفين (عرض/إضافة/حذف)", callback_data='adm_manage_admins')],
         [InlineKeyboardButton("📢 إذاعة عامة للدفعة", callback_data='adm_broadcast')],
         [InlineKeyboardButton("📊 إحصائيات البوت", callback_data='adm_stats')],
         [InlineKeyboardButton("🏠 خروج", callback_data='main_menu')]
     ]
     
-    text = "🔐 **لوحة تحكم إدارة البوت الشاملة:**\n\nاختر العملية التي تريد القيام بها:"
+    text = "🔐 **لوحة تحكم إدارة البوت الشاملة (صلاحيات كاملة):**\n\nاختر العملية التي تريد القيام بها:"
     if update.message:
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     elif update.callback_query:
@@ -301,7 +298,58 @@ async def admin_sub_name_saved(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(f"✅ تم بنجاح إضافة مادة **({sub_name})** إلى (سنة ثالثة - {term})!", parse_mode='Markdown')
     return ConversationHandler.END
 
-# --- ب. خطوات إضافة محتوى/رابط لمادة ---
+# --- ب. خطوات حذف مادة ---
+async def admin_del_sub_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    keyboard = [
+        [InlineKeyboardButton("📖 الفصل الأول", callback_data='dterm_1')],
+        [InlineKeyboardButton("📖 الفصل الثاني", callback_data='dterm_2')]
+    ]
+    await query.edit_message_text("اختر الفصل الدراسي للمادة التي تريد حذفها:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return DEL_SUB_TERM
+
+async def admin_del_term_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    term_name = "الفصل الأول" if query.data == 'dterm_1' else "الفصل الثاني"
+    context.user_data['del_term'] = term_name
+
+    conn = sqlite3.connect('cyber_study.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name FROM subjects WHERE year = ? AND term = ?", ("سنة ثالثة", term_name))
+    subjects = cursor.fetchall()
+    conn.close()
+
+    if not subjects:
+        await query.edit_message_text("⚠️ لا توجد مواد مضافة في هذا الفصل لحذفها.")
+        return ConversationHandler.END
+
+    keyboard = []
+    for sub_id, sub_name in subjects:
+        keyboard.append([InlineKeyboardButton(f"❌ حذف: {sub_name}", callback_data=f"delsub_{sub_id}")])
+    
+    await query.edit_message_text("اختر المادة التي تريد حذفها نهائياً:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return DEL_SUB_CHOOSE
+
+async def admin_del_sub_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    sub_id = query.data.split('_')[1]
+
+    conn = sqlite3.connect('cyber_study.db')
+    cursor = conn.cursor()
+    # حذف المحتويات والأقسام والمادة نفسها
+    cursor.execute("DELETE FROM contents WHERE subject_id = ?", (sub_id,))
+    cursor.execute("DELETE FROM custom_categories WHERE subject_id = ?", (sub_id,))
+    cursor.execute("DELETE FROM subjects WHERE id = ?", (sub_id,))
+    conn.commit()
+    conn.close()
+
+    await query.edit_message_text("✅ تم حذف المادة وكل محتوياتها بنجاح!")
+    return ConversationHandler.END
+
+# --- ج. خطوات إضافة محتوى/رابط لمادة ---
 async def admin_add_cont_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -387,7 +435,7 @@ async def admin_cont_url_saved(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(f"✅ تم بنجاح إضافة ({title}) إلى قسم ({category})!", parse_mode='Markdown')
     return ConversationHandler.END
 
-# --- ج. خطوات إضافة قسم/زر جديد للمادة ---
+# --- د. خطوات إضافة قسم/زر جديد للمادة ---
 async def admin_add_cat_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -442,36 +490,88 @@ async def admin_cat_name_saved(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(f"✅ تم إضافة زر القسم الجديد **({cat_name})** بنجاح للمادة!", parse_mode='Markdown')
     return ConversationHandler.END
 
-# --- د. إضافة مشرف جديد (يدعم Username أو ID) ---
-async def admin_add_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- هـ. إدارة المشرفين (عرض، إضافة باليوزر وجلب ID تلقائياً، وحذف) ---
+async def admin_manage_admins_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    conn = sqlite3.connect('cyber_study.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT admin_id, username FROM admins")
+    admins = cursor.fetchall()
+    conn.close()
+
+    text = "👥 **إدارة المشرفين:**\n\nالمشرفون الحاليون في النظام:\n"
+    keyboard = []
+    
+    if DEFAULT_ADMIN_ID:
+        text += f"• الأدمن الأساسي (Root): `{DEFAULT_ADMIN_ID}`\n"
+
+    for aid, auname in admins:
+        name_display = auname if auname else aid
+        text += f"• {name_display} (ID: `{aid}`)\n"
+        keyboard.append([InlineKeyboardButton(f"❌ حذف المشرف: {name_display}", callback_data=f"deladmin_{aid}")])
+
+    keyboard.append([InlineKeyboardButton("➕ إضافة مشرف جديد", callback_data='adm_add_admin_start')])
+    keyboard.append([InlineKeyboardButton("🔙 رجوع لوحة الأدمن", callback_data='back_to_admin')])
+
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+async def admin_add_admin_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
         "👥 **إضافة مشرف جديد:**\n\n"
-        "أرسل الآن **اسم المستخدم (Username)** مثل `@username` أو الـ **Telegram ID** الخاص بالشخص المراد ترقيته لأدمن:",
+        "أرسل الآن **اسم المستخدم (Username)** مثل `@username` وسيقوم البوت تلقائياً بجلب الـ ID الخاص به وحفظه:",
         parse_mode='Markdown'
     )
     return ADD_ADMIN_INPUT
 
 async def admin_add_admin_saved(update: Update, context: ContextTypes.DEFAULT_TYPE):
     input_text = update.message.text.strip()
-    if not input_text.startswith("@") and not input_text.isdigit():
-        input_text = f"@{input_text}"
+    target_id = None
+    target_username = input_text
+
+    # إذا أدخل اليوزر، نقوم بجلب الـ ID الحقيقي عبر تيليجرام تلقائياً
+    if input_text.startswith("@") or not input_text.isdigit():
+        try:
+            chat = await context.bot.get_chat(input_text)
+            target_id = str(chat.id)
+            target_username = f"@{chat.username}" if chat.username else input_text
+        except Exception as e:
+            await update.message.reply_text(f"❌ عذراً، لم أستطع العثور على هذا المستخدم. تأكد أنه تفاعل مع البوت من قبل أو أرسل الـ ID الرقمي مباشرة.\nالخطأ: {e}")
+            return ConversationHandler.END
+    else:
+        target_id = input_text
+        target_username = input_text
 
     try:
         conn = sqlite3.connect('cyber_study.db')
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO admins (admin_identifier) VALUES (?)", (input_text,))
+        cursor.execute("INSERT INTO admins (admin_id, username) VALUES (?, ?)", (target_id, target_username))
         conn.commit()
         conn.close()
-        await update.message.reply_text(f"✅ تم منح صلاحيات الإدارة بنجاح للمشرف: `{input_text}`", parse_mode='Markdown')
+        await update.message.reply_text(f"✅ تم بنجاح تعيين المشرف `{target_username}` (ID: `{target_id}`) كأدمن في البوت!", parse_mode='Markdown')
     except sqlite3.IntegrityError:
         await update.message.reply_text("⚠️ هذا المستخدم مسجل كأدمن مسبقاً.")
     except Exception as e:
         await update.message.reply_text(f"حدث خطأ: {e}")
     return ConversationHandler.END
 
-# --- هـ. الإذاعة العامة (Broadcast) ---
+async def admin_delete_admin_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    aid_to_delete = query.data.split('_')[1]
+
+    conn = sqlite3.connect('cyber_study.db')
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM admins WHERE admin_id = ?", (aid_to_delete,))
+    conn.commit()
+    conn.close()
+
+    await query.edit_message_text("✅ تم إزالة صلاحيات الإدارة عن هذا المستخدم بنجاح.")
+
+# --- و. الإذاعة العامة (Broadcast) ---
 async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -501,7 +601,7 @@ async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(f"✅ تمت الإذاعة بنجاح! وصل الإشعار إلى ({success_count}) طالباً.")
     return ConversationHandler.END
 
-# --- و. إحصائيات البوت ---
+# --- ز. إحصائيات البوت ---
 async def admin_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -522,7 +622,7 @@ async def admin_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"📘 إجمالي المواد المضافة: `{total_subjects}`\n"
         f"📄 إجمالي الملفات والروابط: `{total_contents}`\n"
     )
-    keyboard = [[InlineKeyboardButton("🔙 رجوع للوحة الأدمن", callback_data='back_to_admin')]]
+    keyboard = [[InlineKeyboardButton("🔙 رجوع لوحة الأدمن", callback_data='back_to_admin')]]
     await query.edit_message_text(stats_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 async def back_to_admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -548,6 +648,15 @@ async def main_async():
         states={
             ADD_SUB_TERM: [CallbackQueryHandler(admin_sub_term_chosen, pattern='^term_[12]$')],
             ADD_SUB_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_sub_name_saved)]
+        },
+        fallbacks=[]
+    )
+
+    del_sub_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_del_sub_start, pattern='^adm_del_sub$')],
+        states={
+            DEL_SUB_TERM: [CallbackQueryHandler(admin_del_term_chosen, pattern='^dterm_[12]$')],
+            DEL_SUB_CHOOSE: [CallbackQueryHandler(admin_del_sub_execute, pattern='^delsub_')]
         },
         fallbacks=[]
     )
@@ -579,7 +688,7 @@ async def main_async():
     )
 
     add_admin_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_add_admin_start, pattern='^adm_add_admin$')],
+        entry_points=[CallbackQueryHandler(admin_add_admin_prompt, pattern='^adm_add_admin_start$')],
         states={
             ADD_ADMIN_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_admin_saved)]
         },
@@ -597,18 +706,20 @@ async def main_async():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_start))
     app.add_handler(add_sub_handler)
+    app.add_handler(del_sub_handler)
     app.add_handler(add_cont_handler)
     app.add_handler(add_cat_handler)
     app.add_handler(add_admin_handler)
     app.add_handler(broadcast_handler)
 
+    app.add_handler(CallbackQueryHandler(admin_manage_admins_handler, pattern='^adm_manage_admins$'))
+    app.add_handler(CallbackQueryHandler(admin_delete_admin_execute, pattern='^deladmin_'))
     app.add_handler(CallbackQueryHandler(admin_stats_handler, pattern='^adm_stats$'))
     app.add_handler(CallbackQueryHandler(back_to_admin_handler, pattern='^back_to_admin$'))
     
-    # معالج التصفح بالكيبورد للطلاب
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, student_text_navigation))
 
-    print("🚀 بوت الأمن السيبراني يعمل بأزرار الكيبورد الثابتة وميزة رفع الأدمن باليوزر...")
+    print("🚀 بوت الأمن السيبراني يعمل بالصلاحيات الكاملة وميزة جلب الآيدي من اليوزر...")
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
