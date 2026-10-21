@@ -1,667 +1,741 @@
 import os
 import sqlite3
 import asyncio
-from aiohttp import web
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, Update
+import logging
+from contextlib import contextmanager
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, KeyboardButton
+)
+from telegram.error import TelegramError, Forbidden, BadRequest
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, 
-    MessageHandler, ContextTypes, ConversationHandler, filters
+    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
+    ContextTypes, filters
 )
 
-# ----------------------------------------------------
-# 1. إعداد قاعدة البيانات والاتصال
-# ----------------------------------------------------
-TOKEN = os.environ.get("BOT_TOKEN")
-DEFAULT_ADMIN_ID = os.environ.get("ADMIN_ID")
+# ============================================================
+# إعدادات البوت
+# متطلبات التشغيل: Python 3.10+ و python-telegram-bot 20+ و aiohttp (اختياري)
+# متغيرات البيئة المطلوبة: BOT_TOKEN و ADMIN_ID
+# ============================================================
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ROOT_ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
+DB_PATH = os.getenv("DB_PATH", "cyber_study.db")
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("cyber-library")
+
+# عمليات الإدخال المنتظرة للأدمن تحفظ هنا لكل محادثة.
+PENDING_KEY = "admin_pending"
+
+
+@contextmanager
+def db():
+    conn = sqlite3.connect(DB_PATH, timeout=20)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 
 def init_db():
-    conn = sqlite3.connect('cyber_study.db')
-    cursor = conn.cursor()
-    # جدول الأزرار الرئيسية والقوائم الديناميكية
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS menu_buttons (
+    with db() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS admins (
+            admin_id TEXT PRIMARY KEY,
+            added_by TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS bot_users (
+            user_id TEXT PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_seen TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS menu_nodes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            parent_name TEXT,
-            button_name TEXT UNIQUE,
-            action_type TEXT
-        )
-    ''')
-    # جدول المواد
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS subjects (
+            parent_id INTEGER REFERENCES menu_nodes(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            action_type TEXT NOT NULL DEFAULT 'section',
+            action_value TEXT,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_parent ON menu_nodes(parent_id, sort_order, id)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS node_contents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            year TEXT,
-            term TEXT,
-            name TEXT
-        )
-    ''')
-    # جدول المحتوى والروابط
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS contents (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            subject_id INTEGER,
-            category TEXT,
-            title TEXT,
-            url TEXT
-        )
-    ''')
-    # جدول الأقسام المخصصة للمادة
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS custom_categories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            subject_id INTEGER,
-            category_name TEXT
-        )
-    ''')
-    # جدول المشرفين
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS admins (
-            admin_id TEXT UNIQUE
-        )
-    ''')
-    # جدول الطلاب
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS bot_users (
-            user_id TEXT UNIQUE,
-            username TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
+            node_id INTEGER NOT NULL REFERENCES menu_nodes(id) ON DELETE CASCADE,
+            content_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            value TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_content_node ON node_contents(node_id, id)")
+        # ترقية الجداول القديمة التي قد تكون أُنشئت بالإصدار السابق.
+        if table_exists(conn, "admins"):
+            admin_cols = {r["name"] for r in conn.execute("PRAGMA table_info(admins)").fetchall()}
+            if "added_by" not in admin_cols:
+                conn.execute("ALTER TABLE admins ADD COLUMN added_by TEXT")
+            if "created_at" not in admin_cols:
+                conn.execute("ALTER TABLE admins ADD COLUMN created_at TEXT")
+        if table_exists(conn, "bot_users"):
+            user_cols = {r["name"] for r in conn.execute("PRAGMA table_info(bot_users)").fetchall()}
+            if "first_name" not in user_cols:
+                conn.execute("ALTER TABLE bot_users ADD COLUMN first_name TEXT")
+            if "last_seen" not in user_cols:
+                conn.execute("ALTER TABLE bot_users ADD COLUMN last_seen TEXT")
+        conn.execute("""CREATE TABLE IF NOT EXISTS legacy_imports (
+            import_key TEXT PRIMARY KEY,
+            imported_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
 
-init_db()
+    # ترحيل الأزرار القديمة إن كان جدولها موجودًا، دون حذف بياناتها.
+    migrate_legacy_data()
+    seed_default_menu()
 
-def is_user_admin(user_id):
-    str_id = str(user_id)
-    if DEFAULT_ADMIN_ID and str_id == str(DEFAULT_ADMIN_ID):
+
+def table_exists(conn, table_name):
+    row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table_name,)).fetchone()
+    return row is not None
+
+
+def migrate_legacy_data():
+    with db() as conn:
+        if not table_exists(conn, "menu_buttons"):
+            return
+        done = conn.execute("SELECT 1 FROM legacy_imports WHERE import_key='menu_buttons_v1'").fetchone()
+        if done:
+            return
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(menu_buttons)").fetchall()}
+        if not {"button_name", "parent_name"}.issubset(cols):
+            return
+        rows = conn.execute("SELECT button_name, parent_name, action_type FROM menu_buttons ORDER BY id").fetchall() if "id" in cols else conn.execute("SELECT button_name, parent_name, action_type FROM menu_buttons").fetchall()
+        name_to_id = {}
+        # إدخالها كأزرار رئيسية أولًا ثم ربط الأزرار التابعة بأسمائها عند الإمكان.
+        for r in rows:
+            name = (r["button_name"] or "").strip()
+            if not name:
+                continue
+            exists = conn.execute("SELECT id FROM menu_nodes WHERE name=? AND parent_id IS NULL", (name,)).fetchone()
+            if exists:
+                name_to_id[name] = exists["id"]
+            elif not r["parent_name"]:
+                cur = conn.execute("INSERT INTO menu_nodes(parent_id,name,action_type,action_value) VALUES(NULL,?,?,?)", (name, "link" if (r["action_type"] or "").startswith("http") else "section", r["action_type"] if (r["action_type"] or "").startswith("http") else None))
+                name_to_id[name] = cur.lastrowid
+        for r in rows:
+            name = (r["button_name"] or "").strip()
+            parent_name = (r["parent_name"] or "").strip()
+            if not name or not parent_name:
+                continue
+            parent = conn.execute("SELECT id FROM menu_nodes WHERE name=? ORDER BY id LIMIT 1", (parent_name,)).fetchone()
+            if not parent:
+                parent_cur = conn.execute("INSERT INTO menu_nodes(parent_id,name) VALUES(NULL,?)", (parent_name,))
+                parent_id = parent_cur.lastrowid
+            else:
+                parent_id = parent["id"]
+            child = conn.execute("SELECT id FROM menu_nodes WHERE name=? AND parent_id=?", (name, parent_id)).fetchone()
+            if not child:
+                at = r["action_type"] or "section"
+                kind = "link" if at.startswith("http") else "section"
+                conn.execute("INSERT INTO menu_nodes(parent_id,name,action_type,action_value) VALUES(?,?,?,?)", (parent_id, name, kind, at if kind == "link" else None))
+        conn.execute("INSERT OR IGNORE INTO legacy_imports(import_key) VALUES('menu_buttons_v1')")
+
+        # ترحيل المواد القديمة إن كانت موجودة، مع إنشاء سنة/فصل/مادة داخل الشجرة.
+        if table_exists(conn, "subjects") and table_exists(conn, "contents"):
+            if not conn.execute("SELECT 1 FROM legacy_imports WHERE import_key='subjects_v1'").fetchone():
+                subject_cols = {r["name"] for r in conn.execute("PRAGMA table_info(subjects)").fetchall()}
+                content_cols = {r["name"] for r in conn.execute("PRAGMA table_info(contents)").fetchall()}
+                if {"id", "year", "term", "name"}.issubset(subject_cols) and {"subject_id", "category", "title", "url"}.issubset(content_cols):
+                    subjects = conn.execute("SELECT id,year,term,name FROM subjects ORDER BY id").fetchall()
+                    for s in subjects:
+                        year_name = (s["year"] or "سنة غير محددة").strip()
+                        term_name = (s["term"] or "فصل غير محدد").strip()
+                        subj_name = (s["name"] or "مادة بدون اسم").strip()
+                        year = conn.execute("SELECT id FROM menu_nodes WHERE name=? AND parent_id IS NULL", (year_name,)).fetchone()
+                        if year: year_id = year["id"]
+                        else: year_id = conn.execute("INSERT INTO menu_nodes(parent_id,name) VALUES(NULL,?)", (year_name,)).lastrowid
+                        term = conn.execute("SELECT id FROM menu_nodes WHERE name=? AND parent_id=?", (term_name, year_id)).fetchone()
+                        if term: term_id = term["id"]
+                        else: term_id = conn.execute("INSERT INTO menu_nodes(parent_id,name) VALUES(?,?)", (year_id, term_name)).lastrowid
+                        subj = conn.execute("SELECT id FROM menu_nodes WHERE name=? AND parent_id=?", (subj_name, term_id)).fetchone()
+                        if subj: subj_id = subj["id"]
+                        else: subj_id = conn.execute("INSERT INTO menu_nodes(parent_id,name) VALUES(?,?)", (term_id, subj_name)).lastrowid
+                        for c in conn.execute("SELECT category,title,url FROM contents WHERE subject_id=?", (s["id"],)).fetchall():
+                            title = (c["title"] or "محتوى").strip()
+                            url = (c["url"] or "").strip()
+                            if url:
+                                conn.execute("INSERT INTO node_contents(node_id,content_type,title,value) VALUES(?,?,?,?)", (subj_id, "link", f"{c['category'] or 'محتوى'}: {title}", url))
+                    conn.execute("INSERT OR IGNORE INTO legacy_imports(import_key) VALUES('subjects_v1')")
+
+
+def seed_default_menu():
+    with db() as conn:
+        count = conn.execute("SELECT COUNT(*) AS n FROM menu_nodes WHERE parent_id IS NULL").fetchone()["n"]
+        if count == 0:
+            conn.execute("INSERT INTO menu_nodes(parent_id,name,action_type) VALUES(NULL,?,'section')", ("🛡️ تخصص الأمن السيبراني",))
+            conn.execute("INSERT INTO menu_nodes(parent_id,name,action_type) VALUES(NULL,?,'link')", ("📢 قناة الدفعة",))
+            conn.execute("UPDATE menu_nodes SET action_value=? WHERE name=? AND parent_id IS NULL", ("https://t.me/telegram", "📢 قناة الدفعة"))
+            conn.execute("INSERT INTO menu_nodes(parent_id,name,action_type) VALUES(NULL,?,'text')", ("📅 الجدول الدراسي",))
+            conn.execute("UPDATE menu_nodes SET action_value=? WHERE name=? AND parent_id IS NULL", ("لم تتم إضافة الجدول الدراسي بعد. يمكن للإدارة تعديله من لوحة التحكم.", "📅 الجدول الدراسي"))
+
+
+def is_admin(user_id):
+    uid = str(user_id or "")
+    if ROOT_ADMIN_ID and uid == ROOT_ADMIN_ID:
         return True
-    conn = sqlite3.connect('cyber_study.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM admins WHERE admin_id = ?", (str_id,))
-    res = cursor.fetchone()
-    conn.close()
-    return res is not None
+    with db() as conn:
+        return conn.execute("SELECT 1 FROM admins WHERE admin_id=?", (uid,)).fetchone() is not None
 
-def register_user(user_id, username=None):
-    try:
-        conn = sqlite3.connect('cyber_study.db')
-        cursor = conn.cursor()
-        uname = f"@{username}" if username else ""
-        cursor.execute("INSERT OR REPLACE INTO bot_users (user_id, username) VALUES (?, ?)", (str(user_id), uname))
-        conn.commit()
-        conn.close()
-    except:
-        pass
 
-async def get_id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    await update.message.reply_text(f"🆔 **الآيدي الخاص بك هو:**\n`{user_id}`", parse_mode='Markdown')
+def is_root(user_id):
+    return bool(ROOT_ADMIN_ID) and str(user_id) == ROOT_ADMIN_ID
 
-# حالات المحادثة للأدمن
-ADD_SUB_TERM, ADD_SUB_NAME = range(2)
-CONT_SUB, CONT_CAT, CONT_TITLE, CONT_URL = range(2, 6)
-ADD_CAT_SUB, ADD_CAT_NAME = range(6, 8)
-ADD_ADMIN_INPUT = range(8, 9)
-BROADCAST_MSG = range(9, 10)
-DEL_SUB_TERM, DEL_SUB_CHOOSE = range(10, 12)
-ADD_MENU_BTN, EDIT_MENU_BTN = range(12, 14)
 
-# ----------------------------------------------------
-# 2. سيرفر الويب لمنع وضع النوم
-# ----------------------------------------------------
-async def health_check(request):
-    return web.Response(text="Cyber Security Bot is Online & Active!", status=200)
+def register_user(user):
+    if not user:
+        return
+    with db() as conn:
+        conn.execute("""INSERT INTO bot_users(user_id,username,first_name,last_seen)
+            VALUES(?,?,?,CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,
+            first_name=excluded.first_name,last_seen=CURRENT_TIMESTAMP""",
+            (str(user.id), user.username or "", user.first_name or ""))
 
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', health_check)
-    app.router.add_get('/health', health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
 
-# ----------------------------------------------------
-# 3. واجهة الطلاب الديناميكية
-# ----------------------------------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def get_node(node_id):
+    with db() as conn:
+        return conn.execute("SELECT * FROM menu_nodes WHERE id=?", (node_id,)).fetchone()
+
+
+def get_children(parent_id=None):
+    with db() as conn:
+        if parent_id is None:
+            return conn.execute("SELECT * FROM menu_nodes WHERE parent_id IS NULL ORDER BY sort_order,id").fetchall()
+        return conn.execute("SELECT * FROM menu_nodes WHERE parent_id=? ORDER BY sort_order,id", (parent_id,)).fetchall()
+
+
+def breadcrumb(node_id):
+    parts = []
+    with db() as conn:
+        current = conn.execute("SELECT id,parent_id,name FROM menu_nodes WHERE id=?", (node_id,)).fetchone()
+        safety = 0
+        while current and safety < 50:
+            parts.append(current["name"])
+            if current["parent_id"] is None:
+                break
+            current = conn.execute("SELECT id,parent_id,name FROM menu_nodes WHERE id=?", (current["parent_id"],)).fetchone()
+            safety += 1
+    return " / ".join(reversed(parts))
+
+
+def student_keyboard(parent_id=None):
+    nodes = get_children(parent_id)
+    keyboard = [[KeyboardButton(n["name"])] for n in nodes]
+    if parent_id is not None:
+        keyboard.append([KeyboardButton("🔙 رجوع")])
+    keyboard.append([KeyboardButton("🏠 القائمة الرئيسية")])
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+def admin_only(update: Update):
     user = update.effective_user
-    register_user(user.id, user.username)
+    return bool(user and is_admin(user.id))
 
-    # جلب الأزرار الرئيسية المضافة من قاعدة البيانات أو الافتراضية
-    conn = sqlite3.connect('cyber_study.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT button_name FROM menu_buttons WHERE parent_name IS NULL")
-    buttons = cursor.fetchall()
-    conn.close()
 
-    keyboard = []
-    if buttons:
-        for (b_name,) in buttons:
-            keyboard.append([KeyboardButton(b_name)])
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user:
+        register_user(update.effective_user)
+    context.user_data.pop("current_node_id", None)
+    await update.effective_message.reply_text(
+        "🏠 القائمة الرئيسية\n\nاختر القسم المطلوب:",
+        reply_markup=student_keyboard(None),
+    )
+
+
+async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(f"الآيدي الخاص بك: {update.effective_user.id}")
+
+
+async def show_node(update: Update, context: ContextTypes.DEFAULT_TYPE, node):
+    node_id = node["id"]
+    context.user_data["current_node_id"] = node_id
+    children = get_children(node_id)
+    with db() as conn:
+        contents = conn.execute("SELECT * FROM node_contents WHERE node_id=? ORDER BY id", (node_id,)).fetchall()
+    action_type = node["action_type"]
+    value = node["action_value"] or ""
+
+    if action_type == "link" and value:
+        await update.effective_message.reply_text(f"🔗 {node['name']}\n{value}", disable_web_page_preview=True)
+    elif action_type == "text" and value:
+        await update.effective_message.reply_text(value)
+
+    if contents:
+        for item in contents:
+            title = item["title"] or "محتوى"
+            kind = item["content_type"]
+            val = item["value"]
+            try:
+                if kind == "document":
+                    await context.bot.send_document(update.effective_chat.id, document=val, caption=title[:1024])
+                elif kind == "video":
+                    await context.bot.send_video(update.effective_chat.id, video=val, caption=title[:1024])
+                elif kind == "photo":
+                    await context.bot.send_photo(update.effective_chat.id, photo=val, caption=title[:1024])
+                elif kind == "text":
+                    await update.effective_message.reply_text(f"📌 {title}\n\n{val}")
+                elif kind == "link":
+                    await update.effective_message.reply_text(f"🔗 {title}\n{val}", disable_web_page_preview=True)
+            except TelegramError:
+                log.exception("Failed to send content %s", item["id"])
+                await update.effective_message.reply_text(f"تعذر إرسال المحتوى: {title}")
+
+    if children:
+        await update.effective_message.reply_text(
+            f"📂 {node['name']}\n\nاختر قسمًا فرعيًا:",
+            reply_markup=student_keyboard(node_id),
+        )
     else:
-        # أزرار افتراضية أولية لو القائمة فارغة
-        keyboard = [
-            [KeyboardButton("🛡️ تخصص الأمن السيبراني")],
-            [KeyboardButton("📢 قناة الدفعة")],
-            [KeyboardButton("📅 الجدول الدراسي")]
-        ]
+        await update.effective_message.reply_text(
+            f"📂 {node['name']}\n\n{'اختر إجراءً آخر أو ارجع للقائمة.' if contents or value else 'لا توجد أقسام أو محتويات مضافة هنا حتى الآن.'}",
+            reply_markup=student_keyboard(node_id),
+        )
 
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    text = "👋 أهلاً بك في بوت المكتبة الأكاديمية الشاملة!\n\nاختر من الكيبورد أدناه للوصول إلى الأقسام:"
-    
-    if update.message:
-        await update.message.reply_text(text, reply_markup=reply_markup)
 
 async def student_text_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    user = update.effective_user
-    register_user(user.id, user.username)
-
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
+    if update.effective_user:
+        register_user(update.effective_user)
     if text == "🏠 القائمة الرئيسية":
         await start(update, context)
         return
-
-    # فحص لو كان الزر يفتح قناة أو رابط أو قسم فرعي
-    conn = sqlite3.connect('cyber_study.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT action_type FROM menu_buttons WHERE button_name = ?", (text,))
-    res = cursor.fetchone()
-    conn.close()
-
-    if res and res[0] and res[0].startswith("http"):
-        await update.message.reply_text(f"🔗 رابط القسم ({text}):\n{res[0]}")
+    current_id = context.user_data.get("current_node_id")
+    if text == "🔙 رجوع":
+        if current_id is None:
+            await start(update, context)
+            return
+        current = get_node(current_id)
+        parent_id = current["parent_id"] if current else None
+        if parent_id is None:
+            context.user_data.pop("current_node_id", None)
+            await update.message.reply_text("🏠 القائمة الرئيسية", reply_markup=student_keyboard(None))
+        else:
+            parent = get_node(parent_id)
+            await show_node(update, context, parent)
         return
 
-    # التفاعل الافتراضي للتخصصات والسنوات
-    if "الأمن السيبراني" in text or text == "🔙 رجوع للتخصصات":
-        conn = sqlite3.connect('cyber_study.db')
-        cursor = conn.cursor()
-        cursor.execute("SELECT button_name FROM menu_buttons WHERE parent_name = 'الأمن السيبراني'")
-        sub_btns = cursor.fetchall()
-        conn.close()
+    # حل الاسم في المستوى الحالي أولًا لتقليل الالتباس بين الأسماء المتكررة.
+    matches = [n for n in get_children(current_id) if n["name"] == text]
+    if not matches and current_id is not None:
+        matches = [n for n in get_children(None) if n["name"] == text]
+    if not matches:
+        return
+    await show_node(update, context, matches[0])
 
-        keyboard = []
-        if sub_btns:
-            for (sb,) in sub_btns:
-                keyboard.append([KeyboardButton(sb)])
-        else:
-            keyboard = [[KeyboardButton("🎓 سنة ثالثة")], [KeyboardButton("🎓 سنة رابعة")]]
-        
-        keyboard.append([KeyboardButton("🏠 القائمة الرئيسية")])
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        await update.message.reply_text(f"🛡️ **{text}**\n\nاختر السنة الدراسية:", reply_markup=reply_markup, parse_mode='Markdown')
 
-    elif "سنة ثالثة" in text or "سنة رابعة" in text or text == "🔙 رجوع للفصول":
-        context.user_data['current_year'] = text
-        keyboard = [
-            [KeyboardButton("📖 الفصل الأول"), KeyboardButton("📖 الفصل الثاني")],
-            [KeyboardButton("🔙 رجوع للتخصصات")]
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        await update.message.reply_text(f"🎓 **{text}**\n\nاختر الفصل الدراسي:", reply_markup=reply_markup, parse_mode='Markdown')
+# -------------------------- لوحة الإدارة --------------------------
+def admin_home_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧩 إدارة جميع الأزرار", callback_data="a:nodes:0")],
+        [InlineKeyboardButton("➕ إضافة زر رئيسي", callback_data="a:addroot")],
+        [InlineKeyboardButton("📎 إدارة المحتوى", callback_data="a:contentroot")],
+        [InlineKeyboardButton("👥 إدارة المشرفين", callback_data="a:admins")],
+        [InlineKeyboardButton("📊 الإحصائيات", callback_data="a:stats"), InlineKeyboardButton("📢 إذاعة", callback_data="a:broadcast")],
+        [InlineKeyboardButton("🏠 القائمة الرئيسية للطلاب", callback_data="a:studenthome")],
+    ])
 
-    elif text in ["📖 الفصل الأول", "📖 الفصل الثاني"]:
-        term_name = "الفصل الأول" if text == "📖 الفصل الأول" else "الفصل الثاني"
-        year_name = context.user_data.get('current_year', "سنة ثالثة")
-        
-        conn = sqlite3.connect('cyber_study.db')
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, name FROM subjects WHERE year = ? AND term = ?", (year_name, term_name))
-        subjects = cursor.fetchall()
-        conn.close()
 
-        keyboard = []
-        for sub_id, sub_name in subjects:
-            keyboard.append([KeyboardButton(f"📘 {sub_name}")])
-        
-        keyboard.append([KeyboardButton("🔙 رجوع للفصول"), KeyboardButton("🏠 القائمة الرئيسية")])
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        
-        msg = f"📚 **مواد {year_name} - {term_name}:**\n\n"
-        if not subjects:
-            msg += "⚠️ لا توجد مواد مضافة في هذا الفصل بعد."
-        else:
-            msg += "اختر المادة لعرض محتوياتها:"
-            
-        await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not admin_only(update):
+        await update.effective_message.reply_text("❌ غير مصرح لك باستخدام لوحة الإدارة.")
+        return
+    context.user_data.pop(PENDING_KEY, None)
+    await update.effective_message.reply_text("🔐 لوحة إدارة المكتبة\nاختر العملية المطلوبة:", reply_markup=admin_home_keyboard())
 
-    elif text.startswith("📘 "):
-        sub_name_input = text.replace("📘 ", "").strip()
-        conn = sqlite3.connect('cyber_study.db')
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, term FROM subjects WHERE name = ?", (sub_name_input,))
-        sub_info = cursor.fetchone()
 
-        if sub_info:
-            sub_id, sub_term = sub_info
-            cursor.execute("SELECT category_name FROM custom_categories WHERE subject_id = ?", (sub_id,))
-            custom_cats = cursor.fetchall()
-            conn.close()
+def node_list_keyboard(parent_id=None, admin_view=True):
+    nodes = get_children(parent_id)
+    rows = []
+    for n in nodes:
+        label = ("📂 " if n["action_type"] == "section" else "🔗 " if n["action_type"] == "link" else "📝 ") + n["name"]
+        rows.append([InlineKeyboardButton(label[:60], callback_data=f"a:node:{n['id']}")])
+    if parent_id is not None:
+        rows.append([InlineKeyboardButton("➕ إضافة زر داخل هذا القسم", callback_data=f"a:addchild:{parent_id}")])
+    rows.append([InlineKeyboardButton("➕ إضافة زر رئيسي", callback_data="a:addroot")])
+    rows.append([InlineKeyboardButton("🔙 لوحة الإدارة", callback_data="a:home")])
+    return InlineKeyboardMarkup(rows)
 
-            keyboard = [
-                [KeyboardButton(f"📄 ملازم - {sub_name_input}"), KeyboardButton(f"🎥 فيديوهات - {sub_name_input}")],
-                [KeyboardButton(f"📝 امتحانات - {sub_name_input}")]
-            ]
-            for (cat_name,) in custom_cats:
-                keyboard.append([KeyboardButton(f"📌 {cat_name} - {sub_name_input}")])
 
-            keyboard.append([KeyboardButton(f"🔙 رجوع لمواد {sub_term}")])
-            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+async def edit_node_screen(query, node_id):
+    node = get_node(node_id)
+    if not node:
+        await query.edit_message_text("هذا الزر لم يعد موجودًا.", reply_markup=admin_home_keyboard())
+        return
+    parent_text = breadcrumb(node_id)
+    kb = [
+        [InlineKeyboardButton("✏️ تعديل الاسم", callback_data=f"a:rename:{node_id}")],
+        [InlineKeyboardButton("🔀 نقل إلى قسم آخر", callback_data=f"a:move:{node_id}")],
+        [InlineKeyboardButton("🧭 تغيير نوع الزر", callback_data=f"a:type:{node_id}")],
+        [InlineKeyboardButton("🔗 تعيين رابط", callback_data=f"a:setlink:{node_id}")],
+        [InlineKeyboardButton("📝 تعيين نص عند الفتح", callback_data=f"a:settext:{node_id}")],
+        [InlineKeyboardButton("➕ إضافة زر فرعي", callback_data=f"a:addchild:{node_id}")],
+        [InlineKeyboardButton("📎 إضافة محتوى", callback_data=f"a:addcontent:{node_id}")],
+        [InlineKeyboardButton("📚 إدارة محتويات الزر", callback_data=f"a:contents:{node_id}")],
+        [InlineKeyboardButton("🗑️ حذف هذا الزر", callback_data=f"a:delete:{node_id}")],
+        [InlineKeyboardButton("🔙 عرض الأزرار", callback_data=f"a:nodes:{node['parent_id'] or 0}")],
+    ]
+    await query.edit_message_text(
+        f"🧩 إدارة الزر\n\nالاسم: {node['name']}\nالمسار: {parent_text}\nالنوع: {node['action_type']}\n\nاختر ما تريد تعديله:",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
 
-            await update.message.reply_text(f"📘 **مادة: {sub_name_input}**\n\nاختر نوع المحتوى:", reply_markup=reply_markup, parse_mode='Markdown')
 
-    elif text.startswith("🔙 رجوع لمواد "):
-        term_target = text.replace("🔙 رجوع لمواد ", "").strip()
-        update.message.text = f"📖 {term_target}"
+async def ask_text(update, context, prompt, pending):
+    context.user_data[PENDING_KEY] = pending
+    await update.callback_query.edit_message_text(prompt + "\n\nأرسل /cancel للإلغاء.")
+
+
+async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    if not admin_only(update):
+        await q.answer("غير مصرح لك.", show_alert=True)
+        return
+    await q.answer()
+    data = q.data or ""
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "home":
+        context.user_data.pop(PENDING_KEY, None)
+        await q.edit_message_text("🔐 لوحة إدارة المكتبة", reply_markup=admin_home_keyboard())
+    elif action == "studenthome":
+        context.user_data.pop("current_node_id", None)
+        await q.edit_message_text("القائمة الرئيسية للطلاب تظهر من أمر /start.\n\nلوحة الإدارة:", reply_markup=admin_home_keyboard())
+    elif action == "nodes":
+        parent_id = int(parts[2]) if len(parts) > 2 else 0
+        actual_parent = parent_id or None
+        title = "الأزرار الرئيسية" if actual_parent is None else f"الأزرار داخل: {breadcrumb(actual_parent)}"
+        await q.edit_message_text(title, reply_markup=node_list_keyboard(actual_parent))
+    elif action == "node":
+        await edit_node_screen(q, int(parts[2]))
+    elif action == "addroot":
+        await ask_text(update, context, "اكتب اسم الزر الرئيسي الجديد:", {"op": "add_node", "parent_id": None})
+    elif action == "addchild":
+        parent_id = int(parts[2])
+        if not get_node(parent_id):
+            await q.edit_message_text("القسم الأب غير موجود.", reply_markup=admin_home_keyboard())
+            return
+        await ask_text(update, context, f"اكتب اسم الزر الجديد داخل:\n{breadcrumb(parent_id)}", {"op": "add_node", "parent_id": parent_id})
+    elif action == "rename":
+        node_id = int(parts[2])
+        node = get_node(node_id)
+        if node:
+            await ask_text(update, context, f"أرسل الاسم الجديد للزر الحالي:\n{node['name']}", {"op": "rename", "node_id": node_id})
+    elif action == "setlink":
+        node_id = int(parts[2])
+        await ask_text(update, context, "أرسل الرابط الكامل الذي تريد ربطه بهذا الزر (https://...):", {"op": "set_value", "node_id": node_id, "type": "link"})
+    elif action == "settext":
+        node_id = int(parts[2])
+        await ask_text(update, context, "أرسل النص الذي يظهر عند فتح هذا الزر:", {"op": "set_value", "node_id": node_id, "type": "text"})
+    elif action == "type":
+        node_id = int(parts[2])
+        await q.edit_message_text("اختر نوع الزر:", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📂 قسم يفتح أزرارًا فرعية", callback_data=f"a:changetype:{node_id}:section")],
+            [InlineKeyboardButton("🔗 رابط", callback_data=f"a:changetype:{node_id}:link")],
+            [InlineKeyboardButton("📝 نص", callback_data=f"a:changetype:{node_id}:text")],
+            [InlineKeyboardButton("🔙 رجوع", callback_data=f"a:node:{node_id}")],
+        ]))
+    elif action == "changetype":
+        node_id, kind = int(parts[2]), parts[3]
+        with db() as conn:
+            conn.execute("UPDATE menu_nodes SET action_type=?, action_value=CASE WHEN ?='section' THEN NULL ELSE action_value END WHERE id=?", (kind, kind, node_id))
+        await edit_node_screen(q, node_id)
+    elif action == "move":
+        node_id = int(parts[2])
+        nodes = get_children(None)
+        rows = [[InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data=f"a:movehere:{node_id}:0")]]
+        for n in nodes:
+            if n["id"] != node_id and not is_descendant(n["id"], node_id):
+                rows.append([InlineKeyboardButton(f"📂 {n['name'][:45]}", callback_data=f"a:movechoose:{node_id}:{n['id']}")])
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data=f"a:node:{node_id}")])
+        await q.edit_message_text("اختر القسم الرئيسي أو قسمًا رئيسيًا لتصفح أقسامه ثم النقل إليه:", reply_markup=InlineKeyboardMarkup(rows))
+    elif action == "movechoose":
+        node_id, parent_id = int(parts[2]), int(parts[3])
+        children = get_children(parent_id)
+        rows = [[InlineKeyboardButton("✅ انقل إلى هذا القسم", callback_data=f"a:movehere:{node_id}:{parent_id}")]]
+        for n in children:
+            if n["id"] != node_id and not is_descendant(n["id"], node_id):
+                rows.append([InlineKeyboardButton(f"📂 {n['name'][:45]}", callback_data=f"a:movechoose:{node_id}:{n['id']}")])
+        rows.append([InlineKeyboardButton("🔙", callback_data=f"a:node:{node_id}")])
+        await q.edit_message_text(f"اختر وجهة النقل. المسار: {breadcrumb(parent_id)}", reply_markup=InlineKeyboardMarkup(rows))
+    elif action == "movehere":
+        node_id, parent_id = int(parts[2]), int(parts[3])
+        new_parent = parent_id or None
+        if new_parent == node_id or (new_parent is not None and is_descendant(new_parent, node_id)):
+            await q.edit_message_text("لا يمكن نقل الزر داخل نفسه أو داخل أحد أبنائه.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data=f"a:node:{node_id}")]]))
+            return
+        with db() as conn:
+            conn.execute("UPDATE menu_nodes SET parent_id=? WHERE id=?", (new_parent, node_id))
+        await edit_node_screen(q, node_id)
+    elif action == "delete":
+        node_id = int(parts[2])
+        node = get_node(node_id)
+        if node:
+            await q.edit_message_text(
+                f"تأكيد حذف الزر «{node['name']}»؟\nسيتم حذف جميع أزراره الفرعية ومحتوياته المرتبطة به نهائيًا.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🗑️ نعم، احذف", callback_data=f"a:deleteyes:{node_id}")],
+                    [InlineKeyboardButton("إلغاء", callback_data=f"a:node:{node_id}")],
+                ]),
+            )
+    elif action == "deleteyes":
+        node_id = int(parts[2])
+        node = get_node(node_id)
+        parent_id = node["parent_id"] if node else None
+        with db() as conn:
+            conn.execute("DELETE FROM menu_nodes WHERE id=?", (node_id,))
+        await q.edit_message_text("✅ تم حذف الزر وكل ما يتبعه.", reply_markup=node_list_keyboard(parent_id))
+    elif action == "addcontent":
+        node_id = int(parts[2])
+        await q.edit_message_text("اختر نوع المحتوى الذي تريد إضافته:", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📄 ملف PDF/مستند", callback_data=f"a:contentkind:{node_id}:document")],
+            [InlineKeyboardButton("🎥 فيديو", callback_data=f"a:contentkind:{node_id}:video")],
+            [InlineKeyboardButton("🖼️ صورة", callback_data=f"a:contentkind:{node_id}:photo")],
+            [InlineKeyboardButton("🔗 رابط", callback_data=f"a:contentkind:{node_id}:link")],
+            [InlineKeyboardButton("📝 نص", callback_data=f"a:contentkind:{node_id}:text")],
+            [InlineKeyboardButton("🔙 رجوع", callback_data=f"a:node:{node_id}")],
+        ]))
+    elif action == "contentkind":
+        node_id, kind = int(parts[2]), parts[3]
+        context.user_data[PENDING_KEY] = {"op": "add_content_title", "node_id": node_id, "type": kind}
+        await q.edit_message_text("أرسل عنوان المحتوى أولًا، ثم أرسل الملف/الرابط/النص في الرسالة التالية.\n\nأرسل /cancel للإلغاء.")
+    elif action == "contents":
+        node_id = int(parts[2])
+        with db() as conn:
+            items = conn.execute("SELECT id,title,content_type FROM node_contents WHERE node_id=? ORDER BY id", (node_id,)).fetchall()
+        rows = [[InlineKeyboardButton(f"🗑 {i['title'][:40]} ({i['content_type']})", callback_data=f"a:delcontent:{node_id}:{i['id']}")] for i in items]
+        rows.append([InlineKeyboardButton("➕ إضافة محتوى", callback_data=f"a:addcontent:{node_id}")])
+        rows.append([InlineKeyboardButton("🔙 رجوع للزر", callback_data=f"a:node:{node_id}")])
+        await q.edit_message_text("اختر محتوى لحذفه، أو أضف محتوى جديدًا:", reply_markup=InlineKeyboardMarkup(rows))
+    elif action == "delcontent":
+        node_id, content_id = int(parts[2]), int(parts[3])
+        with db() as conn:
+            conn.execute("DELETE FROM node_contents WHERE id=? AND node_id=?", (content_id, node_id))
+        await q.edit_message_text("✅ تم حذف المحتوى.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 إدارة الزر", callback_data=f"a:node:{node_id}")]]))
+    elif action == "admins":
+        if not is_root(update.effective_user.id):
+            await q.edit_message_text("إدارة المشرفين متاحة للأدمن الرئيسي فقط.", reply_markup=admin_home_keyboard())
+            return
+        with db() as conn:
+            admins = conn.execute("SELECT admin_id FROM admins ORDER BY admin_id").fetchall()
+        rows = []
+        for a in admins:
+            rows.append([InlineKeyboardButton(f"❌ حذف المشرف {a['admin_id']}", callback_data=f"a:deladmin:{a['admin_id']}")])
+        rows.append([InlineKeyboardButton("➕ إضافة مشرف", callback_data="a:addadmin")])
+        rows.append([InlineKeyboardButton("🔙 لوحة الإدارة", callback_data="a:home")])
+        text = "👥 إدارة المشرفين\nالأدمن الرئيسي: " + (ROOT_ADMIN_ID or "غير مضبوط") + "\n\n" + ("\n".join(f"• {a['admin_id']}" for a in admins) or "لا يوجد مشرفون إضافيون.")
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
+    elif action == "addadmin":
+        if not is_root(update.effective_user.id):
+            await q.edit_message_text("هذه الصلاحية للأدمن الرئيسي فقط.")
+            return
+        await ask_text(update, context, "أرسل رقم ID الرقمي للمشرف الجديد:", {"op": "add_admin"})
+    elif action == "deladmin":
+        if not is_root(update.effective_user.id):
+            await q.edit_message_text("هذه الصلاحية للأدمن الرئيسي فقط.")
+            return
+        target = parts[2]
+        if target == ROOT_ADMIN_ID:
+            await q.edit_message_text("لا يمكن حذف الأدمن الرئيسي.", reply_markup=admin_home_keyboard())
+            return
+        with db() as conn:
+            conn.execute("DELETE FROM admins WHERE admin_id=?", (target,))
+        await q.edit_message_text(f"تم حذف المشرف {target}.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 إدارة المشرفين", callback_data="a:admins")]]))
+    elif action == "stats":
+        with db() as conn:
+            users = conn.execute("SELECT COUNT(*) n FROM bot_users").fetchone()["n"]
+            nodes = conn.execute("SELECT COUNT(*) n FROM menu_nodes").fetchone()["n"]
+            contents = conn.execute("SELECT COUNT(*) n FROM node_contents").fetchone()["n"]
+            admins = conn.execute("SELECT COUNT(*) n FROM admins").fetchone()["n"]
+        await q.edit_message_text(f"📊 إحصائيات البوت\n\n👥 المستخدمون: {users}\n🧩 الأزرار: {nodes}\n📎 المحتويات: {contents}\n🛠 المشرفون الإضافيون: {admins}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 لوحة الإدارة", callback_data="a:home")]]))
+    elif action == "broadcast":
+        context.user_data[PENDING_KEY] = {"op": "broadcast"}
+        await q.edit_message_text("أرسل رسالة الإذاعة. ستُرسل كنص عادي دون تفسير Markdown.\n\nأرسل /cancel للإلغاء.")
+
+
+def is_descendant(candidate_id, ancestor_id):
+    """True if candidate is nested under ancestor."""
+    with db() as conn:
+        row = conn.execute("SELECT parent_id FROM menu_nodes WHERE id=?", (candidate_id,)).fetchone()
+        safety = 0
+        while row and row["parent_id"] is not None and safety < 100:
+            if row["parent_id"] == ancestor_id:
+                return True
+            row = conn.execute("SELECT parent_id FROM menu_nodes WHERE id=?", (row["parent_id"],)).fetchone()
+            safety += 1
+    return False
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop(PENDING_KEY, None)
+    await update.effective_message.reply_text("تم إلغاء العملية.")
+
+
+async def admin_pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending = context.user_data.get(PENDING_KEY)
+    if not pending:
         await student_text_navigation(update, context)
-
-    elif any(text.startswith(prefix) for prefix in ["📄 ملازم - ", "🎥 فيديوهات - ", "📝 امتحانات - ", "📌 "]):
-        try:
-            if " - " in text:
-                cat_part, sub_name = text.split(" - ", 1)
-                category = cat_part.replace("📄 ملازم", "ملازم").replace("🎥 فيديوهات", "فيديوهات").replace("📝 امتحانات", "امتحانات").replace("📌 ", "")
-            else:
-                return
-
-            conn = sqlite3.connect('cyber_study.db')
-            cursor = conn.cursor()
-            cursor.execute("SELECT id FROM subjects WHERE name = ?", (sub_name,))
-            sub_row = cursor.fetchone()
-
-            if sub_row:
-                sub_id = sub_row[0]
-                cursor.execute("SELECT title, url FROM contents WHERE subject_id = ? AND category = ?", (sub_id, category))
-                items = cursor.fetchall()
-                conn.close()
-
-                text_resp = f"📌 **قسم ({category}) - مادة {sub_name}:**\n\n"
-                if not items:
-                    text_resp += "لا توجد روابط مضافة هنا حالياً."
-                else:
-                    for title, url in items:
-                        text_resp += f"• [{title}]({url})\n"
-
-                await update.message.reply_text(text_resp, parse_mode='Markdown', disable_web_page_preview=True)
-        except:
-            pass
-
-    elif text == "📢 قناة الدفعة":
-        await update.message.reply_text("📢 **قناة الدفعة الرسمية:**\nhttps://t.me/telegram")
-
-# ----------------------------------------------------
-# 4. لوحة تحكم الأدمن الشاملة
-# ----------------------------------------------------
-async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not is_user_admin(user.id):
-        if update.message:
-            await update.message.reply_text("❌ عذراً، هذا الأمر مخصص لإدارة البوت فقط.")
         return
+    if not admin_only(update):
+        context.user_data.pop(PENDING_KEY, None)
+        await update.effective_message.reply_text("غير مصرح.")
+        return
+    message = update.effective_message
+    op = pending.get("op")
+    text = (message.text or "").strip() if message.text is not None else ""
 
-    keyboard = [
-        [InlineKeyboardButton("➕ إضافة زر رئيسي جديد", callback_data='adm_add_menu_btn'), InlineKeyboardButton("❌ حذف زر رئيسي", callback_data='adm_del_menu_btn')],
-        [InlineKeyboardButton("➕ إضافة مادة", callback_data='adm_add_sub'), InlineKeyboardButton("❌ حذف مادة", callback_data='adm_del_sub')],
-        [InlineKeyboardButton("🔗 إضافة رابط/ملزمة", callback_data='adm_add_cont')],
-        [InlineKeyboardButton("🗂️ إضافة قسم فرعي للمادة", callback_data='adm_add_cat')],
-        [InlineKeyboardButton("👥 إدارة المشرفين", callback_data='adm_manage_admins')],
-        [InlineKeyboardButton("📢 إذاعة عامة", callback_data='adm_broadcast'), InlineKeyboardButton("📊 الإحصائيات", callback_data='adm_stats')],
-        [InlineKeyboardButton("🏠 خروج", callback_data='main_menu')]
-    ]
-    
-    text = "🔐 **لوحة التحكم المطلقة (صلاحيات كاملة):**\n\nاختر العملية:"
-    if update.message:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-    elif update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    if op == "add_node":
+        if not text:
+            await message.reply_text("اسم الزر لا يمكن أن يكون فارغًا. أرسل الاسم مرة أخرى.")
+            return
+        parent_id = pending.get("parent_id")
+        with db() as conn:
+            conn.execute("INSERT INTO menu_nodes(parent_id,name,action_type) VALUES(?,?, 'section')", (parent_id, text))
+        context.user_data.pop(PENDING_KEY, None)
+        await message.reply_text(f"✅ أُضيف الزر: {text}\nيمكنك إدارته من /admin.")
+    elif op == "rename":
+        if not text:
+            await message.reply_text("الاسم لا يمكن أن يكون فارغًا. حاول مجددًا.")
+            return
+        node_id = pending["node_id"]
+        with db() as conn:
+            conn.execute("UPDATE menu_nodes SET name=? WHERE id=?", (text, node_id))
+        context.user_data.pop(PENDING_KEY, None)
+        await message.reply_text(f"✅ تم تعديل اسم الزر إلى: {text}")
+    elif op == "set_value":
+        node_id, kind = pending["node_id"], pending["type"]
+        if kind == "link" and not (text.startswith("https://") or text.startswith("http://")):
+            await message.reply_text("الرابط غير صالح. أرسله كاملًا ويبدأ بـ https:// أو http://")
+            return
+        with db() as conn:
+            conn.execute("UPDATE menu_nodes SET action_type=?, action_value=? WHERE id=?", (kind, text, node_id))
+        context.user_data.pop(PENDING_KEY, None)
+        await message.reply_text("✅ تم تحديث الزر.")
+    elif op == "add_content_title":
+        if not text:
+            await message.reply_text("العنوان لا يمكن أن يكون فارغًا.")
+            return
+        pending["title"] = text
+        pending["op"] = "add_content_value"
+        context.user_data[PENDING_KEY] = pending
+        kind = pending["type"]
+        prompts = {"document": "أرسل ملف PDF أو مستندًا الآن.", "video": "أرسل الفيديو الآن.", "photo": "أرسل الصورة الآن.", "link": "أرسل الرابط الكامل الآن.", "text": "أرسل النص المطلوب حفظه الآن."}
+        await message.reply_text(prompts.get(kind, "أرسل المحتوى الآن."))
+    elif op == "add_content_value":
+        kind, title, node_id = pending["type"], pending["title"], pending["node_id"]
+        value = None
+        if kind == "document" and message.document:
+            value = message.document.file_id
+        elif kind == "video" and message.video:
+            value = message.video.file_id
+        elif kind == "photo" and message.photo:
+            value = message.photo[-1].file_id
+        elif kind in ("link", "text") and text:
+            value = text
+        if not value:
+            await message.reply_text("نوع الرسالة لا يطابق المحتوى المطلوب. أرسل النوع الصحيح أو /cancel للإلغاء.")
+            return
+        if kind == "link" and not (value.startswith("https://") or value.startswith("http://")):
+            await message.reply_text("الرابط غير صالح. يجب أن يبدأ بـ https:// أو http://")
+            return
+        with db() as conn:
+            conn.execute("INSERT INTO node_contents(node_id,content_type,title,value) VALUES(?,?,?,?)", (node_id, kind, title, value))
+        context.user_data.pop(PENDING_KEY, None)
+        await message.reply_text("✅ تم حفظ المحتوى بنجاح.")
+    elif op == "add_admin":
+        if not is_root(update.effective_user.id):
+            context.user_data.pop(PENDING_KEY, None)
+            await message.reply_text("إضافة المشرفين للأدمن الرئيسي فقط.")
+            return
+        if not text.isdigit():
+            await message.reply_text("أرسل ID رقميًا فقط.")
+            return
+        if text == ROOT_ADMIN_ID:
+            await message.reply_text("هذا هو الأدمن الرئيسي بالفعل.")
+            return
+        with db() as conn:
+            conn.execute("INSERT OR IGNORE INTO admins(admin_id,added_by) VALUES(?,?)", (text, str(update.effective_user.id)))
+        context.user_data.pop(PENDING_KEY, None)
+        await message.reply_text(f"✅ تم تسجيل المشرف {text}.")
+    elif op == "broadcast":
+        context.user_data.pop(PENDING_KEY, None)
+        with db() as conn:
+            users = [r["user_id"] for r in conn.execute("SELECT user_id FROM bot_users").fetchall()]
+        sent = 0
+        blocked = 0
+        for uid in users:
+            try:
+                await context.bot.send_message(chat_id=int(uid), text=message.text or "")
+                sent += 1
+                await asyncio.sleep(0.04)
+            except Forbidden:
+                blocked += 1
+            except (TelegramError, ValueError):
+                log.exception("Broadcast failed for user %s", uid)
+        await message.reply_text(f"انتهت الإذاعة.\n✅ تم الإرسال: {sent}\n⚠️ تعذر الإرسال: {blocked + max(0, len(users)-sent-blocked)}")
 
-# --- أ. إدارة الأزرار الرئيسية الديناميكية ---
-async def admin_add_menu_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("اكتب الآن **اسم الزر الجديد** الذي تريد إضافته في القائمة الرئيسية (مثال: الجدول الدراسي، سنة رابعة، قناة الدفعة):")
-    return ADD_MENU_BTN
 
-async def admin_add_menu_saved(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    btn_name = update.message.text.strip()
-    try:
-        conn = sqlite3.connect('cyber_study.db')
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO menu_buttons (button_name) VALUES (?)", (btn_name,))
-        conn.commit()
-        conn.close()
-        await update.message.reply_text(f"✅ تم إضافة الزر الرئيسي **({btn_name})** بنجاح!")
-    except Exception as e:
-        await update.message.reply_text(f"خطأ أو الزر موجود مسبقاً: {e}")
-    return ConversationHandler.END
+async def admin_pending_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending = context.user_data.get(PENDING_KEY)
+    if pending and pending.get("op") == "add_content_value":
+        await admin_pending_input(update, context)
+    # تجاهل الملفات غير المطلوبة عندما لا توجد عملية إدارية معلقة.
 
-# --- ب. إضافة مادة وحذفها ---
-async def admin_add_sub_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    keyboard = [
-        [InlineKeyboardButton("📖 الفصل الأول", callback_data='term_1')],
-        [InlineKeyboardButton("📖 الفصل الثاني", callback_data='term_2')]
-    ]
-    await query.edit_message_text("اختر الفصل الدراسي:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return ADD_SUB_TERM
 
-async def admin_sub_term_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    context.user_data['new_sub_term'] = "الفصل الأول" if query.data == 'term_1' else "الفصل الثاني"
-    await query.edit_message_text("اكتب اسم السنة الدراسية للمادة (مثال: سنة ثالثة أو سنة رابعة):")
-    return ADD_SUB_NAME
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Unhandled exception while processing update", exc_info=context.error)
 
-async def admin_sub_name_saved(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # حفظ السنة ثم الانتقال لكتابة اسم المادة
-    if 'temp_year' not in context.user_data:
-        context.user_data['temp_year'] = update.message.text.strip()
-        await update.message.reply_text(f"ممتاز! الآن اكتب **اسم المادة** لـ ({context.user_data['temp_year']} - {context.user_data['new_sub_term']}):")
-        return ADD_SUB_NAME
-    else:
-        sub_name = update.message.text.strip()
-        year = context.user_data['temp_year']
-        term = context.user_data['new_sub_term']
-        
-        conn = sqlite3.connect('cyber_study.db')
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO subjects (year, term, name) VALUES (?, ?, ?)", (year, term, sub_name))
-        conn.commit()
-        conn.close()
 
-        await update.message.reply_text(f"✅ تم إضافة مادة **({sub_name})** بنجاح!")
-        context.user_data.pop('temp_year', None)
-        return ConversationHandler.END
-
-async def admin_del_sub_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    conn = sqlite3.connect('cyber_study.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name, year, term FROM subjects")
-    subjects = cursor.fetchall()
-    conn.close()
-
-    if not subjects:
-        await query.edit_message_text("⚠️ لا توجد مواد مضافة لحذفها.")
-        return ConversationHandler.END
-
-    keyboard = []
-    for sub_id, s_name, s_year, s_term in subjects:
-        keyboard.append([InlineKeyboardButton(f"❌ حذف: {s_name} ({s_year} - {s_term})", callback_data=f"delsub_{sub_id}")])
-    
-    await query.edit_message_text("اختر المادة التي تريد حذفها:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return DEL_SUB_CHOOSE
-
-async def admin_del_sub_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    sub_id = query.data.split('_')[1]
-
-    conn = sqlite3.connect('cyber_study.db')
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM contents WHERE subject_id = ?", (sub_id,))
-    cursor.execute("DELETE FROM custom_categories WHERE subject_id = ?", (sub_id,))
-    cursor.execute("DELETE FROM subjects WHERE id = ?", (sub_id,))
-    conn.commit()
-    conn.close()
-
-    await query.edit_message_text("✅ تم حذف المادة نهائياً.")
-    return ConversationHandler.END
-
-# --- ج. إضافة محتوى وقسم ---
-async def admin_add_cont_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    conn = sqlite3.connect('cyber_study.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name, year, term FROM subjects")
-    subjects = cursor.fetchall()
-    conn.close()
-
-    if not subjects:
-        await query.edit_message_text("⚠️ أضف مواد أولاً.")
-        return ConversationHandler.END
-
-    keyboard = []
-    for sub_id, s_name, s_year, s_term in subjects:
-        keyboard.append([InlineKeyboardButton(f"📘 {s_name} ({s_year})", callback_data=f"csub_{sub_id}")])
-    
-    await query.edit_message_text("اختر المادة الإضافة الملف إليها:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return CONT_SUB
-
-async def admin_cont_sub_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    sub_id = query.data.split('_')[1]
-    context.user_data['target_sub_id'] = sub_id
-
-    conn = sqlite3.connect('cyber_study.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT category_name FROM custom_categories WHERE subject_id = ?", (sub_id,))
-    custom_cats = cursor.fetchall()
-    conn.close()
-
-    keyboard = [
-        [InlineKeyboardButton("📄 ملازم وكتب", callback_data='ccat_ملازم')],
-        [InlineKeyboardButton("🎥 فيديوهات ودروس", callback_data='ccat_فيديوهات')],
-        [InlineKeyboardButton("📝 امتحانات وأسئلة", callback_data='ccat_امتحانات')]
-    ]
-    for (cat_name,) in custom_cats:
-        keyboard.append([InlineKeyboardButton(f"📌 {cat_name}", callback_data=f"ccat_{cat_name}")])
-
-    await query.edit_message_text("اختر القسم:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return CONT_CAT
-
-async def admin_cont_cat_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    category = query.data.split('_', 1)[1]
-    context.user_data['target_category'] = category
-
-    await query.edit_message_text("اكتب عنوان الملف أو المحاضرة:")
-    return CONT_TITLE
-
-async def admin_cont_title_saved(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['target_title'] = update.message.text
-    await update.message.reply_text("أرسل رابط الملف أو الفيديو:")
-    return CONT_URL
-
-async def admin_cont_url_saved(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-    sub_id = context.user_data['target_sub_id']
-    category = context.user_data['target_category']
-    title = context.user_data['target_title']
-
-    conn = sqlite3.connect('cyber_study.db')
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO contents (subject_id, category, title, url) VALUES (?, ?, ?, ?)", (sub_id, category, title, url))
-    conn.commit()
-    conn.close()
-
-    await update.message.reply_text("✅ تم إضافة المحتوى بنجاح!")
-    return ConversationHandler.END
-
-# --- د. إدارة المشرفين ---
-async def admin_manage_admins_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    conn = sqlite3.connect('cyber_study.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT admin_id FROM admins")
-    admins = cursor.fetchall()
-    conn.close()
-
-    text = "👥 **إدارة المشرفين:**\n\n"
-    keyboard = []
-    if DEFAULT_ADMIN_ID:
-        text += f"• الأدمن الرئيسي (Root): `{DEFAULT_ADMIN_ID}`\n"
-
-    for (aid,) in admins:
-        text += f"• مشرف (ID: `{aid}`)\n"
-        keyboard.append([InlineKeyboardButton(f"❌ حذف المشرف: {aid}", callback_data=f"deladmin_{aid}")])
-
-    keyboard.append([InlineKeyboardButton("➕ إضافة مشرف بالـ ID", callback_data='adm_add_admin_start')])
-    keyboard.append([InlineKeyboardButton("🔙 رجوع لوحة الأدمن", callback_data='back_to_admin')])
-
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-
-async def admin_add_admin_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("أرسل الـ ID الرقمي للمشرف الجديد (يمكنه معرفته بإرسال الأمر /id للبوت):")
-    return ADD_ADMIN_INPUT
-
-async def admin_add_admin_saved(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target_id = update.message.text.strip()
-    try:
-        conn = sqlite3.connect('cyber_study.db')
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO admins (admin_id) VALUES (?)", (target_id,))
-        conn.commit()
-        conn.close()
-        await update.message.reply_text(f"✅ تم تعيين المشرف `{target_id}` بنجاح!")
-    except:
-        await update.message.reply_text("⚠️ مسجل مسبقاً أو حدث خطأ.")
-    return ConversationHandler.END
-
-async def admin_delete_admin_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    aid = query.data.split('_')[1]
-    conn = sqlite3.connect('cyber_study.db')
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM admins WHERE admin_id = ?", (aid,))
-    conn.commit()
-    conn.close()
-    await query.edit_message_text("✅ تم حذف المشرف بنجاح.")
-
-# --- هـ. الإذاعة والإحصائيات ---
-async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("📢 أرسل رسالة الإذاعة للطلاب:")
-    return BROADCAST_MSG
-
-async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg_text = update.message.text
-    conn = sqlite3.connect('cyber_study.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM bot_users")
-    users = cursor.fetchall()
-    conn.close()
-
-    count = 0
-    for (u_id,) in users:
-        try:
-            await context.bot.send_message(chat_id=int(u_id), text=f"📢 **تنبيه:**\n\n{msg_text}", parse_mode='Markdown')
-            count += 1
-            await asyncio.sleep(0.05)
-        except:
-            pass
-    await update.message.reply_text(f"✅ تمت الإذاعة إلى ({count}) طالباً.")
-    return ConversationHandler.END
-
-async def admin_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    conn = sqlite3.connect('cyber_study.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM bot_users")
-    u = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM subjects")
-    s = cursor.fetchone()[0]
-    conn.close()
-    
-    await query.edit_message_text(f"📊 الإحصائيات:\n👥 الطلاب: {u}\n📘 المواد: {s}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data='back_to_admin')]]))
-
-async def back_to_admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    update.message = query.message
-    await admin_start(update, context)
-
-# ----------------------------------------------------
-# 5. التشغيل الرئيسي
-# ----------------------------------------------------
-async def main_async():
+async def main():
     if not TOKEN:
-        return
-    await start_web_server()
+        raise RuntimeError("ضع توكن البوت في متغير البيئة BOT_TOKEN.")
+    if not ROOT_ADMIN_ID or not ROOT_ADMIN_ID.isdigit():
+        raise RuntimeError("ضع ID الرقمي للأدمن الرئيسي في متغير البيئة ADMIN_ID.")
+    init_db()
     app = Application.builder().token(TOKEN).build()
-
-    add_menu_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_add_menu_start, pattern='^adm_add_menu_btn$')],
-        states={ADD_MENU_BTN: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_menu_saved)]},
-        fallbacks=[]
-    )
-
-    add_sub_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_add_sub_start, pattern='^adm_add_sub$')],
-        states={
-            ADD_SUB_TERM: [CallbackQueryHandler(admin_sub_term_chosen, pattern='^term_[12]$')],
-            ADD_SUB_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_sub_name_saved)]
-        },
-        fallbacks=[]
-    )
-
-    del_sub_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_del_sub_start, pattern='^adm_del_sub$')],
-        states={DEL_SUB_CHOOSE: [CallbackQueryHandler(admin_del_sub_execute, pattern='^delsub_')]},
-        fallbacks=[]
-    )
-
-    add_cont_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_add_cont_start, pattern='^adm_add_cont$')],
-        states={
-            CONT_SUB: [CallbackQueryHandler(admin_cont_sub_chosen, pattern='^csub_')],
-            CONT_CAT: [CallbackQueryHandler(admin_cont_cat_chosen, pattern='^ccat_')],
-            CONT_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_cont_title_saved)],
-            CONT_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_cont_url_saved)]
-        },
-        fallbacks=[]
-    )
-
-    add_admin_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_add_admin_prompt, pattern='^adm_add_admin_start$')],
-        states={ADD_ADMIN_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_admin_saved)]},
-        fallbacks=[]
-    )
-
-    broadcast_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_broadcast_start, pattern='^adm_broadcast$')],
-        states={BROADCAST_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_send)]},
-        fallbacks=[]
-    )
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("admin", admin_start))
-    app.add_handler(CommandHandler("id", get_id_command))
-
-    app.add_handler(add_menu_handler)
-    app.add_handler(add_sub_handler)
-    app.add_handler(del_sub_handler)
-    app.add_handler(add_cont_handler)
-    app.add_handler(add_admin_handler)
-    app.add_handler(broadcast_handler)
-
-    app.add_handler(CallbackQueryHandler(admin_manage_admins_handler, pattern='^adm_manage_admins$'))
-    app.add_handler(CallbackQueryHandler(admin_delete_admin_execute, pattern='^deladmin_'))
-    app.add_handler(CallbackQueryHandler(admin_stats_handler, pattern='^adm_stats$'))
-    app.add_handler(CallbackQueryHandler(back_to_admin_handler, pattern='^back_to_admin$'))
-    
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, student_text_navigation))
-
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("id", id_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
+    # Callback عام للأزرار الإدارية؛ يتحقق من صلاحية المستخدم داخل كل طلب.
+    app.add_handler(CallbackQueryHandler(admin_callbacks, pattern=r"^a:"))
+    # الرسائل النصية أولًا: إذا كان هناك إدخال أدمن معلق يُعالَج هنا، وإلا تُعامل كتنقل للطالب.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_pending_input))
+    # الملفات والصور والفيديوهات تُستخدم لإضافة محتوى عند وجود عملية معلقة.
+    app.add_handler(MessageHandler(filters.Document.ALL | filters.VIDEO | filters.PHOTO, admin_pending_media))
+    app.add_error_handler(error_handler)
+    log.info("Starting bot")
     await app.initialize()
     await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-    await asyncio.Event().wait()
+    await app.updater.start_polling(drop_pending_updates=False)
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
 
-def main():
-    asyncio.run(main_async())
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    asyncio.run(main())
