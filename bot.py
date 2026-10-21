@@ -512,16 +512,15 @@ async def back_to_admin_handler(update: Update, context: ContextTypes.DEFAULT_TY
     await admin_start(update, context)
 
 # ----------------------------------------------------
-# 5. التشغيل الرئيسي وإعداد المعالجات (Handlers)
+# 5. التشغيل الرئيسي وإعداد المعالجات (متوافق مع Python 3.14)
 # ----------------------------------------------------
-def main():
+async def main_async():
     if not TOKEN:
         print("خطأ: لم يتم تحديد BOT_TOKEN!")
         return
 
     # تشغيل سيرفر الويب في الخلفية لخدمة UptimeRobot
-    loop = asyncio.get_event_loop()
-    loop.create_task(start_web_server())
+    await start_web_server()
 
     app = Application.builder().token(TOKEN).build()
 
@@ -594,7 +593,15 @@ def main():
     app.add_handler(CallbackQueryHandler(student_navigation))
 
     print("🚀 بوت الأمن السيبراني يعمل بكامل طاقته ومميزاته...")
-    app.run_polling(drop_pending_updates=True)
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+    
+    # إبقاء البوت قيد التشغيل
+    await asyncio.Event().wait()
+
+def main():
+    asyncio.run(main_async())
 
 if __name__ == '__main__':
     main()
