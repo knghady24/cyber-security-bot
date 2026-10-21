@@ -441,6 +441,206 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ask_text(update, context, "أرسل النص الذي يظهر عند فتح هذا الزر:", {"op": "set_value", "node_id": node_id, "type": "text"})
     elif action == "type":
         node_id = int(parts[2])
+       text":
+                    await update.effective_message.reply_text(f"📌 {title}\n\n{val}")
+                elif kind == "link":
+                    await update.effective_message.reply_text(f"🔗 {title}\n{val}", disable_web_page_preview=True)
+            except TelegramError:
+                log.exception("Failed to send content %s", item["id"])
+                await update.effective_message.reply_text(f"تعذر إرسال المحتوى: {title}")
+
+    if children:
+        await update.effective_message.reply_text(
+            f"📂 {node['name']}\n\nاختر قسمًا فرعيًا:",
+            reply_markup=student_keyboard(node_id),
+        )
+    else:
+        await update.effective_message.reply_text(
+            f"📂 {node['name']}\n\n{'اختر إجراءً آخر أو ارجع للقائمة.' if contents or value else 'لا توجد أقسام أو محتويات مضافة هنا حتى الآن.'}",
+            reply_markup=student_keyboard(node_id),
+        )
+
+async def student_text_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
+    user = update.effective_user
+    if user:
+        register_user_and_check_new(user)
+
+    if text == "🏠 القائمة الرئيسية":
+        await start(update, context)
+        return
+    current_id = context.user_data.get("current_node_id")
+    if text == "🔙 رجوع":
+        if current_id is None:
+            await start(update, context)
+            return
+        current = get_node(current_id)
+        parent_id = current["parent_id"] if current else None
+        if parent_id is None:
+            context.user_data.pop("current_node_id", None)
+            await update.message.reply_text("🏠 القائمة الرئيسية", reply_markup=student_keyboard(None))
+        else:
+            parent = get_node(parent_id)
+            await show_node(update, context, parent)
+        return
+
+    matches = [n for n in get_children(current_id) if n["name"] == text]
+    if not matches and current_id is not None:
+        matches = [n for n in get_children(None) if n["name"] == text]
+    if not matches:
+        return
+    await show_node(update, context, matches[0])
+
+# -------------------------- لوحة الإدارة --------------------------
+def admin_home_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧩 إدارة جميع الأزرار", callback_data="a:nodes:0")],
+        [InlineKeyboardButton("➕ إضافة زر رئيسي", callback_data="a:addroot")],
+        [InlineKeyboardButton("📎 إدارة المحتوى", callback_data="a:contentroot")],
+        [InlineKeyboardButton("👥 عرض جميع المشتركين", callback_data="a:listusers")],
+        [InlineKeyboardButton("👥 إدارة المشرفين", callback_data="a:admins")],
+        [InlineKeyboardButton("📊 الإحصائيات", callback_data="a:stats"), InlineKeyboardButton("📢 إذاعة", callback_data="a:broadcast")],
+        [InlineKeyboardButton("🏠 القائمة الرئيسية للطلاب", callback_data="a:studenthome")],
+    ])
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not admin_only(update):
+        await update.effective_message.reply_text("❌ غير مصرح لك باستخدام لوحة الإدارة.")
+        return
+    context.user_data.pop(PENDING_KEY, None)
+    await update.effective_message.reply_text("🔐 لوحة إدارة المكتبة\nاختر العملية المطلوبة:", reply_markup=admin_home_keyboard())
+
+def node_list_keyboard(parent_id=None):
+    nodes = get_children(parent_id)
+    rows = []
+    for n in nodes:
+        label = ("📂 " if n["action_type"] == "section" else "🔗 " if n["action_type"] == "link" else "📝 ") + n["name"]
+        rows.append([InlineKeyboardButton(label[:60], callback_data=f"a:node:{n['id']}")])
+    if parent_id is not None:
+        rows.append([InlineKeyboardButton("➕ إضافة زر داخل هذا القسم", callback_data=f"a:addchild:{parent_id}")])
+    rows.append([InlineKeyboardButton("➕ إضافة زر رئيسي", callback_data="a:addroot")])
+    rows.append([InlineKeyboardButton("🔙 لوحة الإدارة", callback_data="a:home")])
+    return InlineKeyboardMarkup(rows)
+
+async def edit_node_screen(query, node_id):
+    node = get_node(node_id)
+    if not node:
+        await query.edit_message_text("هذا الزر لم يعد موجودًا.", reply_markup=admin_home_keyboard())
+        return
+    parent_text = breadcrumb(node_id)
+    kb = [
+        [InlineKeyboardButton("✏️ تعديل الاسم", callback_data=f"a:rename:{node_id}")],
+        [InlineKeyboardButton("🔀 نقل إلى قسم آخر", callback_data=f"a:move:{node_id}")],
+        [InlineKeyboardButton("🧭 تغيير نوع الزر", callback_data=f"a:type:{node_id}")],
+        [InlineKeyboardButton("🔗 تعيين رابط", callback_data=f"a:setlink:{node_id}")],
+        [InlineKeyboardButton("📝 تعيين نص عند الفتح", callback_data=f"a:settext:{node_id}")],
+        [InlineKeyboardButton("📂 عرض الأزرار الفرعية", callback_data=f"a:nodes:{node_id}")],
+        [InlineKeyboardButton("➕ إضافة زر فرعي", callback_data=f"a:addchild:{node_id}")],
+        [InlineKeyboardButton("📎 إضافة محتوى", callback_data=f"a:addcontent:{node_id}")],
+        [InlineKeyboardButton("📚 إدارة محتويات الزر", callback_data=f"a:contents:{node_id}")],
+        [InlineKeyboardButton("🗑️ حذف هذا الزر", callback_data=f"a:delete:{node_id}")],
+        [InlineKeyboardButton("🔙 عرض الأزرار", callback_data=f"a:nodes:{node['parent_id'] or 0}")],
+    ]
+    await query.edit_message_text(
+        f"🧩 إدارة الزر\n\nالاسم: {node['name']}\nالمسار: {parent_text}\nالنوع: {node['action_type']}\n\nاختر ما تريد تعديله:",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+async def ask_text(update, context, prompt, pending):
+    context.user_data[PENDING_KEY] = pending
+    await update.callback_query.edit_message_text(prompt + "\n\nأرسل /cancel للإلغاء.")
+
+async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    if not admin_only(update):
+        await q.answer("غير مصرح لك.", show_alert=True)
+        return
+    await q.answer()
+    data = q.data or ""
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "home":
+        context.user_data.pop(PENDING_KEY, None)
+        await q.edit_message_text("🔐 لوحة إدارة المكتبة", reply_markup=admin_home_keyboard())
+    elif action == "studenthome":
+        context.user_data.pop("current_node_id", None)
+        await q.edit_message_text("القائمة الرئيسية للطلاب تظهر من أمر /start.\n\nلوحة الإدارة:", reply_markup=admin_home_keyboard())
+    elif action == "contentroot":
+        await q.edit_message_text(
+            "📎 إدارة المحتوى:\n\nلإضافة أو تعديل محتويات أي قسم أو مادة (ملازم، فيديوهات، روابط)، اذهب إلى:\n🧩 إدارة جميع الأزرار -> اختر القسم المطلوب -> ثم اختر 'إضافة محتوى' أو 'إدارة محتويات الزر'.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🧩 الذهاب لإدارة الأزرار", callback_data="a:nodes:0")],
+                [InlineKeyboardButton("🔙 لوحة الإدارة", callback_data="a:home")]
+            ])
+        )
+    elif action == "listusers":
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id, username, first_name, last_seen FROM bot_users ORDER BY last_seen DESC")
+                users = cur.fetchall()
+        
+        total = len(users)
+        text = f"👥 قائمة جميع المشتركين في البوت (الإجمالي: {total}):\n\n"
+        
+        user_lines = []
+        for i, u in enumerate(users, 1):
+            uname = f"@{u['username']}" if u['username'] else "بدون يوزر"
+            fname = u['first_name'] or "مستخدم"
+            uid = u['user_id']
+            user_lines.append(f"{i}. {fname} | {uname} | ID: {uid}")
+        
+        full_text = text + "\n".join(user_lines)
+        
+        if len(full_text) > 3800:
+            full_text = text + "\n".join(user_lines[:100]) + f"\n\n... و {len(user_lines) - 100} مستخدمين آخرين."
+        
+        if not users:
+            full_text = "👥 لا يوجد مشتركين في البوت حتى الآن."
+            
+        try:
+            await q.edit_message_text(
+                full_text, 
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 لوحة الإدارة", callback_data="a:home")]])
+            )
+        except Exception:
+            await q.message.reply_text(
+                full_text,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 لوحة الإدارة", callback_data="a:home")]])
+            )
+
+    elif action == "nodes":
+        parent_id = int(parts[2]) if len(parts) > 2 else 0
+        actual_parent = parent_id or None
+        title = "الأزرار الرئيسية" if actual_parent is None else f"الأزرار داخل: {breadcrumb(actual_parent)}"
+        await q.edit_message_text(title, reply_markup=node_list_keyboard(actual_parent))
+    elif action == "node":
+        await edit_node_screen(q, int(parts[2]))
+    elif action == "addroot":
+        await ask_text(update, context, "اكتب اسم الزر الرئيسي الجديد:", {"op": "add_node", "parent_id": None})
+    elif action == "addchild":
+        parent_id = int(parts[2])
+        if not get_node(parent_id):
+            await q.edit_message_text("القسم الأب غير موجود.", reply_markup=admin_home_keyboard())
+            return
+        await ask_text(update, context, f"اكتب اسم الزر الجديد داخل:\n{breadcrumb(parent_id)}", {"op": "add_node", "parent_id": parent_id})
+    elif action == "rename":
+        node_id = int(parts[2])
+        node = get_node(node_id)
+        if node:
+            await ask_text(update, context, f"أرسل الاسم الجديد للزر الحالي:\n{node['name']}", {"op": "rename", "node_id": node_id})
+    elif action == "setlink":
+        node_id = int(parts[2])
+        await ask_text(update, context, "أرسل الرابط الكامل الذي تريد ربطه بهذا الزر (https://...):", {"op": "set_value", "node_id": node_id, "type": "link"})
+    elif action == "settext":
+        node_id = int(parts[2])
+        await ask_text(update, context, "أرسل النص الذي يظهر عند فتح هذا الزر:", {"op": "set_value", "node_id": node_id, "type": "text"})
+    elif action == "type":
+        node_id = int(parts[2])
               await context.bot.send_document(update.effective_chat.id, document=val, caption=title[:1024])
                 elif kind == "video":
                     await context.bot.send_video(update.effective_chat.id, video=val, caption=title[:1024])
