@@ -1,8 +1,6 @@
 import os
 import asyncio
 import logging
-import socket
-from urllib.parse import urlparse, urlunparse
 from contextlib import contextmanager
 from aiohttp import web
 import psycopg2
@@ -50,34 +48,14 @@ async def start_web_server():
     log.info(f"Web server started on port {PORT}")
 
 # ------------------------------------------------------------
-# التعامل مع قاعدة البيانات مع إجبار استخدام IPv4 لتجاوز قيود Render
+# الاتصال بقاعدة البيانات السحابية (PostgreSQL / Supabase Pooler)
 # ------------------------------------------------------------
 @contextmanager
 def db():
     if not DATABASE_URL:
         raise RuntimeError("متغير البيئة DATABASE_URL غير موجود أو فارغ!")
     
-    dsn = DATABASE_URL
-    try:
-        parsed = urlparse(dsn)
-        if parsed.hostname:
-            # إجبار النظام على جلب عنوان IPv4 فقط لتجنب خطأ IPv6 على Render
-            addrs = socket.getaddrinfo(parsed.hostname, parsed.port or 5432, socket.AF_INET, socket.SOCK_STREAM)
-            if addrs:
-                ipv4 = addrs[0][4][0]
-                netloc = parsed.netloc.replace(parsed.hostname, ipv4)
-                parsed = parsed._replace(netloc=netloc)
-                dsn = urlunparse(parsed)
-    except Exception as e:
-        log.warning(f"IPv4 resolution notice: {e}")
-
-    if "?" not in dsn:
-        dsn += "?connect_timeout=15"
-    else:
-        if "connect_timeout" not in dsn:
-            dsn += "&connect_timeout=15"
-
-    conn = psycopg2.connect(dsn, cursor_factory=psycopg2.extras.RealDictCursor)
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         yield conn
         conn.commit()
