@@ -4,6 +4,8 @@ import asyncio
 import logging
 from contextlib import contextmanager
 from aiohttp import web
+import psycopg2
+import psycopg2.extras
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, KeyboardButton
@@ -15,11 +17,11 @@ from telegram.ext import (
 )
 
 # ============================================================
-# إعدادات البوت وتكامل Render
+# إعدادات البوت وتكامل Render و Supabase
 # ============================================================
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ROOT_ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
-DB_PATH = os.getenv("DB_PATH", "cyber_study.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 PORT = int(os.getenv("PORT", 8080))
 
 logging.basicConfig(
@@ -34,7 +36,7 @@ PENDING_KEY = "admin_pending"
 # سيرفر فحص الصحة (Health Check Server) لمنع خمول Render
 # ------------------------------------------------------------
 async def health_check(request):
-    return web.Response(text="Cyber Library Bot is Running Perfectly!", status=200)
+    return web.Response(text="Cyber Library Bot is Running Perfectly with Supabase!", status=200)
 
 async def start_web_server():
     app = web.Application()
@@ -47,14 +49,14 @@ async def start_web_server():
     log.info(f"Web server started on port {PORT}")
 
 # ------------------------------------------------------------
-# التعامل مع قاعدة البيانات
+# التعامل مع قاعدة البيانات السحابية (PostgreSQL / Supabase)
 # ------------------------------------------------------------
 @contextmanager
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=20)
-    conn.row_factory = sqlite3.Row
+    if not DATABASE_URL:
+        raise RuntimeError("متغير البيئة DATABASE_URL غير موجود أو فارغ!")
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        conn.execute("PRAGMA foreign_keys = ON")
         yield conn
         conn.commit()
     except Exception:
@@ -63,135 +65,387 @@ def db():
     finally:
         conn.close()
 
+def table_exists(conn, table_name):
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM information_schema.tables WHERE table_name = %s", (table_name,))
+        return cur.fetchone() is not None
+
 def init_db():
     with db() as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS admins (
-            admin_id TEXT PRIMARY KEY,
-            added_by TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS bot_users (
-            user_id TEXT PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            last_seen TEXT DEFAULT CURRENT_TIMESTAMP
-        )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS menu_nodes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            parent_id INTEGER REFERENCES menu_nodes(id) ON DELETE CASCADE,
-            name TEXT NOT NULL,
-            action_type TEXT NOT NULL DEFAULT 'section',
-            action_value TEXT,
-            sort_order INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )""")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_parent ON menu_nodes(parent_id, sort_order, id)")
-        conn.execute("""CREATE TABLE IF NOT EXISTS node_contents (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            node_id INTEGER NOT NULL REFERENCES menu_nodes(id) ON DELETE CASCADE,
-            content_type TEXT NOT NULL,
-            title TEXT NOT NULL,
-            value TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )""")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_content_node ON node_contents(node_id, id)")
-        
-        if table_exists(conn, "admins"):
-            admin_cols = {r["name"] for r in conn.execute("PRAGMA table_info(admins)").fetchall()}
-            if "added_by" not in admin_cols:
-                conn.execute("ALTER TABLE admins ADD COLUMN added_by TEXT")
-            if "created_at" not in admin_cols:
-                conn.execute("ALTER TABLE admins ADD COLUMN created_at TEXT")
-        if table_exists(conn, "bot_users"):
-            user_cols = {r["name"] for r in conn.execute("PRAGMA table_info(bot_users)").fetchall()}
-            if "first_name" not in user_cols:
-                conn.execute("ALTER TABLE bot_users ADD COLUMN first_name TEXT")
-            if "last_seen" not in user_cols:
-                conn.execute("ALTER TABLE bot_users ADD COLUMN last_seen TEXT")
-        conn.execute("""CREATE TABLE IF NOT EXISTS legacy_imports (
-            import_key TEXT PRIMARY KEY,
-            imported_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )""")
-
-    migrate_legacy_data()
+        with conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS admins (
+                admin_id TEXT PRIMARY KEY,
+                added_by TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS bot_users (
+                user_id TEXT PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS menu_nodes (
+                id SERIAL PRIMARY KEY,
+                parent_id INTEGER REFERENCES menu_nodes(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                action_type TEXT NOT NULL DEFAULT 'section',
+                action_value TEXT,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS node_contents (
+                id SERIAL PRIMARY KEY,
+                node_id INTEGER NOT NULL REFERENCES menu_nodes(id) ON DELETE CASCADE,
+                content_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                value TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS legacy_imports (
+                import_key TEXT PRIMARY KEY,
+                imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
     seed_default_menu()
-
-def table_exists(conn, table_name):
-    row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table_name,)).fetchone()
-    return row is not None
-
-def migrate_legacy_data():
-    with db() as conn:
-        if not table_exists(conn, "menu_buttons"):
-            return
-        done = conn.execute("SELECT 1 FROM legacy_imports WHERE import_key='menu_buttons_v1'").fetchone()
-        if done:
-            return
-        cols = {r["name"] for r in conn.execute("PRAGMA table_info(menu_buttons)").fetchall()}
-        if not {"button_name", "parent_name"}.issubset(cols):
-            return
-        rows = conn.execute("SELECT button_name, parent_name, action_type FROM menu_buttons ORDER BY id").fetchall() if "id" in cols else conn.execute("SELECT button_name, parent_name, action_type FROM menu_buttons").fetchall()
-        name_to_id = {}
-        for r in rows:
-            name = (r["button_name"] or "").strip()
-            if not name:
-                continue
-            exists = conn.execute("SELECT id FROM menu_nodes WHERE name=? AND parent_id IS NULL", (name,)).fetchone()
-            if exists:
-                name_to_id[name] = exists["id"]
-            elif not r["parent_name"]:
-                cur = conn.execute("INSERT INTO menu_nodes(parent_id,name,action_type,action_value) VALUES(NULL,?,?,?)", (name, "link" if (r["action_type"] or "").startswith("http") else "section", r["action_type"] if (r["action_type"] or "").startswith("http") else None))
-                name_to_id[name] = cur.lastrowid
-        for r in rows:
-            name = (r["button_name"] or "").strip()
-            parent_name = (r["parent_name"] or "").strip()
-            if not name or not parent_name:
-                continue
-            parent = conn.execute("SELECT id FROM menu_nodes WHERE name=? ORDER BY id LIMIT 1", (parent_name,)).fetchone()
-            if not parent:
-                parent_cur = conn.execute("INSERT INTO menu_nodes(parent_id,name) VALUES(NULL,?)", (parent_name,))
-                parent_id = parent_cur.lastrowid
-            else:
-                parent_id = parent["id"]
-            child = conn.execute("SELECT id FROM menu_nodes WHERE name=? AND parent_id=?", (name, parent_id)).fetchone()
-            if not child:
-                at = r["action_type"] or "section"
-                kind = "link" if at.startswith("http") else "section"
-                conn.execute("INSERT INTO menu_nodes(parent_id,name,action_type,action_value) VALUES(?,?,?,?)", (parent_id, name, kind, at if kind == "link" else None))
-        conn.execute("INSERT OR IGNORE INTO legacy_imports(import_key) VALUES('menu_buttons_v1')")
-
-        if table_exists(conn, "subjects") and table_exists(conn, "contents"):
-            if not conn.execute("SELECT 1 FROM legacy_imports WHERE import_key='subjects_v1'").fetchone():
-                subject_cols = {r["name"] for r in conn.execute("PRAGMA table_info(subjects)").fetchall()}
-                content_cols = {r["name"] for r in conn.execute("PRAGMA table_info(contents)").fetchall()}
-                if {"id", "year", "term", "name"}.issubset(subject_cols) and {"subject_id", "category", "title", "url"}.issubset(content_cols):
-                    subjects = conn.execute("SELECT id,year,term,name FROM subjects ORDER BY id").fetchall()
-                    for s in subjects:
-                        year_name = (s["year"] or "سنة غير محددة").strip()
-                        term_name = (s["term"] or "فصل غير محدد").strip()
-                        subj_name = (s["name"] or "مادة بدون اسم").strip()
-                        year = conn.execute("SELECT id FROM menu_nodes WHERE name=? AND parent_id IS NULL", (year_name,)).fetchone()
-                        if year: year_id = year["id"]
-                        else: year_id = conn.execute("INSERT INTO menu_nodes(parent_id,name) VALUES(NULL,?)", (year_name,)).lastrowid
-                        term = conn.execute("SELECT id FROM menu_nodes WHERE name=? AND parent_id=?", (term_name, year_id)).fetchone()
-                        if term: term_id = term["id"]
-                        else: term_id = conn.execute("INSERT INTO menu_nodes(parent_id,name) VALUES(?,?)", (year_id, term_name)).lastrowid
-                        subj = conn.execute("SELECT id FROM menu_nodes WHERE name=? AND parent_id=?", (subj_name, term_id)).fetchone()
-                        if subj: subj_id = subj["id"]
-                        else: subj_id = conn.execute("INSERT INTO menu_nodes(parent_id,name) VALUES(?,?)", (term_id, subj_name)).lastrowid
-                        for c in conn.execute("SELECT category,title,url FROM contents WHERE subject_id=?", (s["id"],)).fetchall():
-                            title = (c["title"] or "محتوى").strip()
-                            url = (c["url"] or "").strip()
-                            if url:
-                                conn.execute("INSERT INTO node_contents(node_id,content_type,title,value) VALUES(?,?,?,?)", (subj_id, "link", f"{c['category'] or 'محتوى'}: {title}", url))
-                    conn.execute("INSERT OR IGNORE INTO legacy_imports(import_key) VALUES('subjects_v1')")
 
 def seed_default_menu():
     with db() as conn:
-        count = conn.execute("SELECT COUNT(*) AS n FROM menu_nodes WHERE parent_id IS NULL").fetchone()["n"]
-        if count == 0:
-            conn.execute("INSERT INTO menu_nodes(parent_id,name,action_type) VALUES(NULL,?,'section')", ("🛡️ تخصص الأمن السيبراني",))
-            conn.execute("INSERT INTO menu_nodes(parent_id,name,action_type) VALUES(NULL,?,'link')", ("📢 قناة الدفعة",))
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM menu_nodes WHERE parent_id IS NULL")
+            count = cur.fetchone()["n"]
+            if count == 0:
+                cur.execute("INSERT INTO menu_nodes(parent_id,name,action_type) VALUES(NULL,%s,'section')", ("🛡️ تخصص الأمن السيبراني",))
+                cur.execute("INSERT INTO menu_nodes(parent_id,name,action_type) VALUES(NULL,%s,'link')", ("📢 قناة الدفعة",))
+                cur.execute("UPDATE menu_nodes SET action_value=%s WHERE name=%s AND parent_id IS NULL", ("https://t.me/telegram", "📢 قناة الدفعة"))
+                cur.execute("INSERT INTO menu_nodes(parent_id,name,action_type) VALUES(NULL,%s,'text')", ("📅 الجدول الدراسي",))
+                cur.execute("UPDATE menu_nodes SET action_value=%s WHERE name=%s AND parent_id IS NULL", ("لم تتم إضافة الجدول الدراسي بعد. يمكن للإدارة تعديله من لوحة التحكم.", "📅 الجدول الدراسي"))
+
+def is_admin(user_id):
+    uid = str(user_id or "")
+    if ROOT_ADMIN_ID and uid == ROOT_ADMIN_ID:
+        return True
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM admins WHERE admin_id=%s", (uid,))
+            return cur.fetchone() is not None
+
+def is_root(user_id):
+    return bool(ROOT_ADMIN_ID) and str(user_id) == ROOT_ADMIN_ID
+
+def register_user_and_check_new(user):
+    if not user:
+        return False
+    is_new = False
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM bot_users WHERE user_id=%s", (str(user.id),))
+            if not cur.fetchone():
+                is_new = True
+            cur.execute("""
+                INSERT INTO bot_users(user_id,username,first_name,last_seen)
+                VALUES(%s,%s,%s,CURRENT_TIMESTAMP)
+                ON CONFLICT (user_id) DO UPDATE SET 
+                username=EXCLUDED.username, 
+                first_name=EXCLUDED.first_name, 
+                last_seen=CURRENT_TIMESTAMP
+            """, (str(user.id), user.username or "", user.first_name or ""))
+    return is_new
+
+def get_node(node_id):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM menu_nodes WHERE id=%s", (node_id,))
+            return cur.fetchone()
+
+def get_children(parent_id=None):
+    with db() as conn:
+        with conn.cursor() as cur:
+            if parent_id is None:
+                cur.execute("SELECT * FROM menu_nodes WHERE parent_id IS NULL ORDER BY sort_order, id")
+            else:
+                cur.execute("SELECT * FROM menu_nodes WHERE parent_id=%s ORDER BY sort_order, id", (parent_id,))
+            return cur.fetchall()
+
+def breadcrumb(node_id):
+    parts = []
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,parent_id,name FROM menu_nodes WHERE id=%s", (node_id,))
+            current = cur.fetchone()
+            safety = 0
+            while current and safety < 50:
+                parts.append(current["name"])
+                if current["parent_id"] is None:
+                    break
+                cur.execute("SELECT id,parent_id,name FROM menu_nodes WHERE id=%s", (current["parent_id"],))
+                current = cur.fetchone()
+                safety += 1
+    return " / ".join(reversed(parts))
+
+def student_keyboard(parent_id=None):
+    nodes = get_children(parent_id)
+    keyboard = [[KeyboardButton(n["name"])] for n in nodes]
+    if parent_id is not None:
+        keyboard.append([KeyboardButton("🔙 رجوع")])
+    keyboard.append([KeyboardButton("🏠 القائمة الرئيسية")])
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def admin_only(update: Update):
+    user = update.effective_user
+    return bool(user and is_admin(user.id))
+
+# ------------------------------------------------------------
+# أوامر ومعالجات البوت
+# ------------------------------------------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user:
+        is_new = register_user_and_check_new(user)
+        if is_new and ROOT_ADMIN_ID:
+            username_str = f"@{user.username}" if user.username else "بدون يوزر"
+            msg = (
+                f"👤 مستخدم جديد دخل البوت!\n\n"
+                f"• الاسم: {user.first_name}\n"
+                f"• اليوزر: {username_str}\n"
+                f"• الآيدي: {user.id}"
+            )
+            try:
+                await context.bot.send_message(chat_id=int(ROOT_ADMIN_ID), text=msg)
+            except Exception as e:
+                log.warning(f"Failed to send new user notification: {e}")
+
+    context.user_data.pop("current_node_id", None)
+    await update.effective_message.reply_text(
+        "🏠 القائمة الرئيسية\n\nاختر القسم المطلوب:",
+        reply_markup=student_keyboard(None),
+    )
+
+async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(f"الآيدي الخاص بك: {update.effective_user.id}")
+
+async def show_node(update: Update, context: ContextTypes.DEFAULT_TYPE, node):
+    node_id = node["id"]
+    context.user_data["current_node_id"] = node_id
+    children = get_children(node_id)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM node_contents WHERE node_id=%s ORDER BY id", (node_id,))
+            contents = cur.fetchall()
+            
+    action_type = node["action_type"]
+    value = node["action_value"] or ""
+
+    if action_type == "link" and value:
+        await update.effective_message.reply_text(f"🔗 {node['name']}\n{value}", disable_web_page_preview=True)
+    elif action_type == "text" and value:
+        await update.effective_message.reply_text(value)
+
+    if contents:
+        for item in contents:
+            title = item["title"] or "محتوى"
+            kind = item["content_type"]
+            val = item["value"]
+            try:
+                if kind == "document":
+                    await context.bot.send_document(update.effective_chat.id, document=val, caption=title[:1024])
+                elif kind == "video":
+                    await context.bot.send_video(update.effective_chat.id, video=val, caption=title[:1024])
+                elif kind == "photo":
+                    await context.bot.send_photo(update.effective_chat.id, photo=val, caption=title[:1024])
+                elif kind == "text":
+                    await update.effective_message.reply_text(f"📌 {title}\n\n{val}")
+                elif kind == "link":
+                    await update.effective_message.reply_text(f"🔗 {title}\n{val}", disable_web_page_preview=True)
+            except TelegramError:
+                log.exception("Failed to send content %s", item["id"])
+                await update.effective_message.reply_text(f"تعذر إرسال المحتوى: {title}")
+
+    if children:
+        await update.effective_message.reply_text(
+            f"📂 {node['name']}\n\nاختر قسمًا فرعيًا:",
+            reply_markup=student_keyboard(node_id),
+        )
+    else:
+        await update.effective_message.reply_text(
+            f"📂 {node['name']}\n\n{'اختر إجراءً آخر أو ارجع للقائمة.' if contents or value else 'لا توجد أقسام أو محتويات مضافة هنا حتى الآن.'}",
+            reply_markup=student_keyboard(node_id),
+        )
+
+async def student_text_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
+    user = update.effective_user
+    if user:
+        register_user_and_check_new(user)
+
+    if text == "🏠 القائمة الرئيسية":
+        await start(update, context)
+        return
+    current_id = context.user_data.get("current_node_id")
+    if text == "🔙 رجوع":
+        if current_id is None:
+            await start(update, context)
+            return
+        current = get_node(current_id)
+        parent_id = current["parent_id"] if current else None
+        if parent_id is None:
+            context.user_data.pop("current_node_id", None)
+            await update.message.reply_text("🏠 القائمة الرئيسية", reply_markup=student_keyboard(None))
+        else:
+            parent = get_node(parent_id)
+            await show_node(update, context, parent)
+        return
+
+    matches = [n for n in get_children(current_id) if n["name"] == text]
+    if not matches and current_id is not None:
+        matches = [n for n in get_children(None) if n["name"] == text]
+    if not matches:
+        return
+    await show_node(update, context, matches[0])
+
+# -------------------------- لوحة الإدارة --------------------------
+def admin_home_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧩 إدارة جميع الأزرار", callback_data="a:nodes:0")],
+        [InlineKeyboardButton("➕ إضافة زر رئيسي", callback_data="a:addroot")],
+        [InlineKeyboardButton("📎 إدارة المحتوى", callback_data="a:contentroot")],
+        [InlineKeyboardButton("👥 عرض جميع المشتركين", callback_data="a:listusers")],
+        [InlineKeyboardButton("👥 إدارة المشرفين", callback_data="a:admins")],
+        [InlineKeyboardButton("📊 الإحصائيات", callback_data="a:stats"), InlineKeyboardButton("📢 إذاعة", callback_data="a:broadcast")],
+        [InlineKeyboardButton("🏠 القائمة الرئيسية للطلاب", callback_data="a:studenthome")],
+    ])
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not admin_only(update):
+        await update.effective_message.reply_text("❌ غير مصرح لك باستخدام لوحة الإدارة.")
+        return
+    context.user_data.pop(PENDING_KEY, None)
+    await update.effective_message.reply_text("🔐 لوحة إدارة المكتبة\nاختر العملية المطلوبة:", reply_markup=admin_home_keyboard())
+
+def node_list_keyboard(parent_id=None):
+    nodes = get_children(parent_id)
+    rows = []
+    for n in nodes:
+        label = ("📂 " if n["action_type"] == "section" else "🔗 " if n["action_type"] == "link" else "📝 ") + n["name"]
+        rows.append([InlineKeyboardButton(label[:60], callback_data=f"a:node:{n['id']}")])
+    if parent_id is not None:
+        rows.append([InlineKeyboardButton("➕ إضافة زر داخل هذا القسم", callback_data=f"a:addchild:{parent_id}")])
+    rows.append([InlineKeyboardButton("➕ إضافة زر رئيسي", callback_data="a:addroot")])
+    rows.append([InlineKeyboardButton("🔙 لوحة الإدارة", callback_data="a:home")])
+    return InlineKeyboardMarkup(rows)
+
+async def edit_node_screen(query, node_id):
+    node = get_node(node_id)
+    if not node:
+        await query.edit_message_text("هذا الزر لم يعد موجودًا.", reply_markup=admin_home_keyboard())
+        return
+    parent_text = breadcrumb(node_id)
+    kb = [
+        [InlineKeyboardButton("✏️ تعديل الاسم", callback_data=f"a:rename:{node_id}")],
+        [InlineKeyboardButton("🔀 نقل إلى قسم آخر", callback_data=f"a:move:{node_id}")],
+        [InlineKeyboardButton("🧭 تغيير نوع الزر", callback_data=f"a:type:{node_id}")],
+        [InlineKeyboardButton("🔗 تعيين رابط", callback_data=f"a:setlink:{node_id}")],
+        [InlineKeyboardButton("📝 تعيين نص عند الفتح", callback_data=f"a:settext:{node_id}")],
+        [InlineKeyboardButton("📂 عرض الأزرار الفرعية", callback_data=f"a:nodes:{node_id}")],
+        [InlineKeyboardButton("➕ إضافة زر فرعي", callback_data=f"a:addchild:{node_id}")],
+        [InlineKeyboardButton("📎 إضافة محتوى", callback_data=f"a:addcontent:{node_id}")],
+        [InlineKeyboardButton("📚 إدارة محتويات الزر", callback_data=f"a:contents:{node_id}")],
+        [InlineKeyboardButton("🗑️ حذف هذا الزر", callback_data=f"a:delete:{node_id}")],
+        [InlineKeyboardButton("🔙 عرض الأزرار", callback_data=f"a:nodes:{node['parent_id'] or 0}")],
+    ]
+    await query.edit_message_text(
+        f"🧩 إدارة الزر\n\nالاسم: {node['name']}\nالمسار: {parent_text}\nالنوع: {node['action_type']}\n\nاختر ما تريد تعديله:",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+async def ask_text(update, context, prompt, pending):
+    context.user_data[PENDING_KEY] = pending
+    await update.callback_query.edit_message_text(prompt + "\n\nأرسل /cancel للإلغاء.")
+
+async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    if not admin_only(update):
+        await q.answer("غير مصرح لك.", show_alert=True)
+        return
+    await q.answer()
+    data = q.data or ""
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "home":
+        context.user_data.pop(PENDING_KEY, None)
+        await q.edit_message_text("🔐 لوحة إدارة المكتبة", reply_markup=admin_home_keyboard())
+    elif action == "studenthome":
+        context.user_data.pop("current_node_id", None)
+        await q.edit_message_text("القائمة الرئيسية للطلاب تظهر من أمر /start.\n\nلوحة الإدارة:", reply_markup=admin_home_keyboard())
+    elif action == "contentroot":
+        await q.edit_message_text(
+            "📎 إدارة المحتوى:\n\nلإضافة أو تعديل محتويات أي قسم أو مادة (ملازم، فيديوهات، روابط)، اذهب إلى:\n🧩 إدارة جميع الأزرار -> اختر القسم المطلوب -> ثم اختر 'إضافة محتوى' أو 'إدارة محتويات الزر'.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🧩 الذهاب لإدارة الأزرار", callback_data="a:nodes:0")],
+                [InlineKeyboardButton("🔙 لوحة الإدارة", callback_data="a:home")]
+            ])
+        )
+    elif action == "listusers":
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id, username, first_name, last_seen FROM bot_users ORDER BY last_seen DESC")
+                users = cur.fetchall()
+        
+        total = len(users)
+        text = f"👥 قائمة جميع المشتركين في البوت (الإجمالي: {total}):\n\n"
+        
+        user_lines = []
+        for i, u in enumerate(users, 1):
+            uname = f"@{u['username']}" if u['username'] else "بدون يوزر"
+            fname = u['first_name'] or "مستخدم"
+            uid = u['user_id']
+            user_lines.append(f"{i}. {fname} | {uname} | ID: {uid}")
+        
+        full_text = text + "\n".join(user_lines)
+        
+        if len(full_text) > 3800:
+            full_text = text + "\n".join(user_lines[:100]) + f"\n\n... و {len(user_lines) - 100} مستخدمين آخرين."
+        
+        if not users:
+            full_text = "👥 لا يوجد مشتركين في البوت حتى الآن."
+            
+        try:
+            await q.edit_message_text(
+                full_text, 
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 لوحة الإدارة", callback_data="a:home")]])
+            )
+        except Exception:
+            await q.message.reply_text(
+                full_text,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 لوحة الإدارة", callback_data="a:home")]])
+            )
+
+    elif action == "nodes":
+        parent_id = int(parts[2]) if len(parts) > 2 else 0
+        actual_parent = parent_id or None
+        title = "الأزرار الرئيسية" if actual_parent is None else f"الأزرار داخل: {breadcrumb(actual_parent)}"
+        await q.edit_message_text(title, reply_markup=node_list_keyboard(actual_parent))
+    elif action == "node":
+        await edit_node_screen(q, int(parts[2]))
+    elif action == "addroot":
+        await ask_text(update, context, "اكتب اسم الزر الرئيسي الجديد:", {"op": "add_node", "parent_id": None})
+    elif action == "addchild":
+        parent_id = int(parts[2])
+        if not get_node(parent_id):
+            await q.edit_message_text("القسم الأب غير موجود.", reply_markup=admin_home_keyboard())
+            return
+        await ask_text(update, context, f"اكتب اسم الزر الجديد داخل:\n{breadcrumb(parent_id)}", {"op": "add_node", "parent_id": parent_id})
+    elif action == "rename":
+        node_id = int(parts[2])
+        node = get_node(node_id)
+        if node:
+            await ask_text(update, context, f"أرسل الاسم الجديد للزر الحالي:\n{node['name']}", {"op": "rename", "node_id": node_id})
+    elif action == "setlink":
+        node_id = int(parts[2])
+  INSERT INTO menu_nodes(parent_id,name,action_type) VALUES(NULL,?,'link')", ("📢 قناة الدفعة",))
             conn.execute("UPDATE menu_nodes SET action_value=? WHERE name=? AND parent_id IS NULL", ("https://t.me/telegram", "📢 قناة الدفعة"))
             conn.execute("INSERT INTO menu_nodes(parent_id,name,action_type) VALUES(NULL,?,'text')", ("📅 الجدول الدراسي",))
             conn.execute("UPDATE menu_nodes SET action_value=? WHERE name=? AND parent_id IS NULL", ("لم تتم إضافة الجدول الدراسي بعد. يمكن للإدارة تعديله من لوحة التحكم.", "📅 الجدول الدراسي"))
