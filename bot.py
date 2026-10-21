@@ -180,7 +180,6 @@ async def student_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE)
         cursor.execute("SELECT name, term FROM subjects WHERE id = ?", (sub_id,))
         sub_info = cursor.fetchone()
         
-        # جلب الأقسام الإضافية المخصصة لهذه المادة
         cursor.execute("SELECT category_name FROM custom_categories WHERE subject_id = ?", (sub_id,))
         custom_cats = cursor.fetchall()
         conn.close()
@@ -195,7 +194,6 @@ async def student_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 [InlineKeyboardButton("📝 امتحانات وأسئلة", callback_data=f"cat_{sub_id}_امتحانات")]
             ]
             
-            # إضافة الأقسام المخصصة إن وجدت كأزرار
             for (cat_name,) in custom_cats:
                 keyboard.append([InlineKeyboardButton(f"📌 {cat_name}", callback_data=f"cat_{sub_id}_{cat_name}")])
 
@@ -235,7 +233,8 @@ async def student_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_user_admin(user_id):
-        await update.message.reply_text("❌ عذراً، هذا الأمر مخصص لإدارة البوت فقط.")
+        if update.message:
+            await update.message.reply_text("❌ عذراً، هذا الأمر مخصص لإدارة البوت فقط.")
         return
 
     keyboard = [
@@ -324,7 +323,6 @@ async def admin_cont_sub_chosen(update: Update, context: ContextTypes.DEFAULT_TY
     sub_id = query.data.split('_')[1]
     context.user_data['target_sub_id'] = sub_id
 
-    # جلب الأقسام الأساسية والمخصصة لهذه المادة
     conn = sqlite3.connect('cyber_study.db')
     cursor = conn.cursor()
     cursor.execute("SELECT category_name FROM custom_categories WHERE subject_id = ?", (sub_id,))
@@ -433,7 +431,7 @@ async def admin_add_admin_start(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     await query.edit_message_text(
         "👥 **إضافة مشرف جديد:**\n\n"
-        "أرسل الآن الـ Telegram ID الخاص بالشخص المراد إضافته كأدمن (يمكنه معرفة الأيدي من بوتات مثل @userinfobot):",
+        "أرسل الآن الـ Telegram ID الخاص بالشخص المراد إضافته كأدمن:",
         parse_mode='Markdown'
     )
     return ADD_ADMIN_ID
@@ -457,7 +455,7 @@ async def admin_add_admin_saved(update: Update, context: ContextTypes.DEFAULT_TY
 async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("📢 **الإذاعة العامة:**\n\nAرسل الآن الرسالة التي تريد إرسالها لجميع طلاب الدفعة المشتركين في البوت:", parse_mode='Markdown')
+    await query.edit_message_text("📢 **الإذاعة العامة:**\n\nأرسل الآن الرسالة التي تريد إرسالها لجميع طلاب الدفعة المشتركين في البوت:", parse_mode='Markdown')
     return BROADCAST_MSG
 
 async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -476,7 +474,7 @@ async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYP
         try:
             await context.bot.send_message(chat_id=int(u_id), text=f"📢 **تنبيه هام للدفعة:**\n\n{msg_text}", parse_mode='Markdown')
             success_count += 1
-            await asyncio.sleep(0.1) # لمنع حظر التليجرام بسبب السرعة
+            await asyncio.sleep(0.1)
         except:
             pass
 
@@ -510,7 +508,6 @@ async def admin_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def back_to_admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    # استدعاء شاشة الأدمن الرئيسية
     update.message = query.message
     await admin_start(update, context)
 
@@ -522,7 +519,7 @@ def main():
         print("خطأ: لم يتم تحديد BOT_TOKEN!")
         return
 
-    # تشغيل سيرفر الويب غير المتزامن في الخلفية لخدمة UptimeRobot
+    # تشغيل سيرفر الويب في الخلفية لخدمة UptimeRobot
     loop = asyncio.get_event_loop()
     loop.create_task(start_web_server())
 
@@ -597,7 +594,7 @@ def main():
     app.add_handler(CallbackQueryHandler(student_navigation))
 
     print("🚀 بوت الأمن السيبراني يعمل بكامل طاقته ومميزاته...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
