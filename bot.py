@@ -48,13 +48,22 @@ async def start_web_server():
     log.info(f"Web server started on port {PORT}")
 
 # ------------------------------------------------------------
-# التعامل مع قاعدة البيانات السحابية (PostgreSQL / Supabase)
+# التعامل مع قاعدة البيانات السحابية (PostgreSQL / Supabase) مع حل مشكلة Network is unreachable
 # ------------------------------------------------------------
 @contextmanager
 def db():
     if not DATABASE_URL:
         raise RuntimeError("متغير البيئة DATABASE_URL غير موجود أو فارغ!")
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    
+    # إصلاح مشكلة الاتصال على Render بإجبار استخدام IPv4 والمهلة الزمنية
+    dsn = DATABASE_URL
+    if "?" not in dsn:
+        dsn += "?connect_timeout=10"
+    else:
+        if "connect_timeout" not in dsn:
+            dsn += "&connect_timeout=10"
+
+    conn = psycopg2.connect(dsn, cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         yield conn
         conn.commit()
