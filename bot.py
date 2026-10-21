@@ -266,13 +266,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_new and ROOT_ADMIN_ID:
             username_str = f"@{user.username}" if user.username else "بدون يوزر"
             msg = (
-                f"👤 **مستخدم جديد دخل البوت!**\n\n"
+                f"👤 مستخدم جديد دخل البوت!\n\n"
                 f"• الاسم: {user.first_name}\n"
                 f"• اليوزر: {username_str}\n"
-                f"• الآيدي: `{user.id}`"
+                f"• الآيدي: {user.id}"
             )
             try:
-                await context.bot.send_message(chat_id=int(ROOT_ADMIN_ID), text=msg, parse_mode="Markdown")
+                await context.bot.send_message(chat_id=int(ROOT_ADMIN_ID), text=msg)
             except Exception as e:
                 log.warning(f"Failed to send new user notification: {e}")
 
@@ -283,7 +283,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(f"الآيدي الخاص بك: `{update.effective_user.id}`", parse_mode="Markdown")
+    await update.effective_message.reply_text(f"الآيدي الخاص بك: {update.effective_user.id}")
 
 async def show_node(update: Update, context: ContextTypes.DEFAULT_TYPE, node):
     node_id = node["id"]
@@ -453,29 +453,34 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             users = conn.execute("SELECT user_id, username, first_name, last_seen FROM bot_users ORDER BY last_seen DESC").fetchall()
         
         total = len(users)
-        text = f"👥 **قائمة جميع المشتركين في البوت (الإجمالي: {total}):**\n\n"
+        text = f"👥 قائمة جميع المشتركين في البوت (الإجمالي: {total}):\n\n"
         
         user_lines = []
         for i, u in enumerate(users, 1):
             uname = f"@{u['username']}" if u['username'] else "بدون يوزر"
             fname = u['first_name'] or "مستخدم"
             uid = u['user_id']
-            user_lines.append(f"{i}. {fname} | {uname} | `{uid}`")
+            user_lines.append(f"{i}. {fname} | {uname} | ID: {uid}")
         
         full_text = text + "\n".join(user_lines)
         
-        # حماية ضد تجاوز الحد الأقصى لطول الرسالة في تليجرام (4096 حرف)
-        if len(full_text) > 4000:
-            full_text = text + "\n".join(user_lines[:120]) + f"\n\n... و {len(user_lines) - 120} مستخدمين آخرين."
+        if len(full_text) > 3800:
+            full_text = text + "\n".join(user_lines[:100]) + f"\n\n... و {len(user_lines) - 100} مستخدمين آخرين."
         
         if not users:
             full_text = "👥 لا يوجد مشتركين في البوت حتى الآن."
             
-        await q.edit_message_text(
-            full_text, 
-            parse_mode="Markdown", 
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 لوحة الإدارة", callback_data="a:home")]])
-        )
+        try:
+            await q.edit_message_text(
+                full_text, 
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 لوحة الإدارة", callback_data="a:home")]])
+            )
+        except Exception as e:
+            await q.message.reply_text(
+                full_text,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 لوحة الإدارة", callback_data="a:home")]])
+            )
+
     elif action == "nodes":
         parent_id = int(parts[2]) if len(parts) > 2 else 0
         actual_parent = parent_id or None
@@ -676,7 +681,7 @@ async def admin_pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif op == "set_value":
         node_id, kind = pending["node_id"], pending["type"]
         if kind == "link" and not (text.startswith("https://") or text.startswith("http://")):
-            await message.reply_text("الرابط غير صالح. أرسلهم كاملًا ويبدأ بـ https:// أو http://")
+            await message.reply_text("الرابط غير صالح. أرسله كاملًا ويبدأ بـ https:// أو http://")
             return
         with db() as conn:
             conn.execute("UPDATE menu_nodes SET action_type=?, action_value=? WHERE id=?", (kind, text, node_id))
