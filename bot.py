@@ -3,6 +3,7 @@ import sqlite3
 import asyncio
 import logging
 from contextlib import contextmanager
+from aiohttp import web
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, KeyboardButton
@@ -14,23 +15,40 @@ from telegram.ext import (
 )
 
 # ============================================================
-# إعدادات البوت
-# متطلبات التشغيل: Python 3.10+ و python-telegram-bot 20+ و aiohttp (اختياري)
-# متغيرات البيئة المطلوبة: BOT_TOKEN و ADMIN_ID
+# إعدادات البوت وتكامل Render
 # ============================================================
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ROOT_ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
 DB_PATH = os.getenv("DB_PATH", "cyber_study.db")
+PORT = int(os.getenv("PORT", 8080))
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger("cyber-library")
 
-# عمليات الإدخال المنتظرة للأدمن تحفظ هنا لكل محادثة.
 PENDING_KEY = "admin_pending"
 
+# ------------------------------------------------------------
+# سيرفر فحص الصحة (Health Check Server) لمنع خمول Render
+# ------------------------------------------------------------
+async def health_check(request):
+    return web.Response(text="Cyber Library Bot is Running Perfectly!", status=200)
 
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    app.router.add_get('/health', health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    log.info(f"Web server started on port {PORT}")
+
+# ------------------------------------------------------------
+# التعامل مع قاعدة البيانات
+# ------------------------------------------------------------
 @contextmanager
 def db():
     conn = sqlite3.connect(DB_PATH, timeout=20)
@@ -44,7 +62,6 @@ def db():
         raise
     finally:
         conn.close()
-
 
 def init_db():
     with db() as conn:
@@ -78,7 +95,7 @@ def init_db():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_content_node ON node_contents(node_id, id)")
-        # ترقية الجداول القديمة التي قد تكون أُنشئت بالإصدار السابق.
+        
         if table_exists(conn, "admins"):
             admin_cols = {r["name"] for r in conn.execute("PRAGMA table_info(admins)").fetchall()}
             if "added_by" not in admin_cols:
@@ -96,15 +113,12 @@ def init_db():
             imported_at TEXT DEFAULT CURRENT_TIMESTAMP
         )""")
 
-    # ترحيل الأزرار القديمة إن كان جدولها موجودًا، دون حذف بياناتها.
     migrate_legacy_data()
     seed_default_menu()
-
 
 def table_exists(conn, table_name):
     row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table_name,)).fetchone()
     return row is not None
-
 
 def migrate_legacy_data():
     with db() as conn:
@@ -118,7 +132,6 @@ def migrate_legacy_data():
             return
         rows = conn.execute("SELECT button_name, parent_name, action_type FROM menu_buttons ORDER BY id").fetchall() if "id" in cols else conn.execute("SELECT button_name, parent_name, action_type FROM menu_buttons").fetchall()
         name_to_id = {}
-        # إدخالها كأزرار رئيسية أولًا ثم ربط الأزرار التابعة بأسمائها عند الإمكان.
         for r in rows:
             name = (r["button_name"] or "").strip()
             if not name:
@@ -147,7 +160,6 @@ def migrate_legacy_data():
                 conn.execute("INSERT INTO menu_nodes(parent_id,name,action_type,action_value) VALUES(?,?,?,?)", (parent_id, name, kind, at if kind == "link" else None))
         conn.execute("INSERT OR IGNORE INTO legacy_imports(import_key) VALUES('menu_buttons_v1')")
 
-        # ترحيل المواد القديمة إن كانت موجودة، مع إنشاء سنة/فصل/مادة داخل الشجرة.
         if table_exists(conn, "subjects") and table_exists(conn, "contents"):
             if not conn.execute("SELECT 1 FROM legacy_imports WHERE import_key='subjects_v1'").fetchone():
                 subject_cols = {r["name"] for r in conn.execute("PRAGMA table_info(subjects)").fetchall()}
@@ -174,7 +186,6 @@ def migrate_legacy_data():
                                 conn.execute("INSERT INTO node_contents(node_id,content_type,title,value) VALUES(?,?,?,?)", (subj_id, "link", f"{c['category'] or 'محتوى'}: {title}", url))
                     conn.execute("INSERT OR IGNORE INTO legacy_imports(import_key) VALUES('subjects_v1')")
 
-
 def seed_default_menu():
     with db() as conn:
         count = conn.execute("SELECT COUNT(*) AS n FROM menu_nodes WHERE parent_id IS NULL").fetchone()["n"]
@@ -185,7 +196,6 @@ def seed_default_menu():
             conn.execute("INSERT INTO menu_nodes(parent_id,name,action_type) VALUES(NULL,?,'text')", ("📅 الجدول الدراسي",))
             conn.execute("UPDATE menu_nodes SET action_value=? WHERE name=? AND parent_id IS NULL", ("لم تتم إضافة الجدول الدراسي بعد. يمكن للإدارة تعديله من لوحة التحكم.", "📅 الجدول الدراسي"))
 
-
 def is_admin(user_id):
     uid = str(user_id or "")
     if ROOT_ADMIN_ID and uid == ROOT_ADMIN_ID:
@@ -193,10 +203,8 @@ def is_admin(user_id):
     with db() as conn:
         return conn.execute("SELECT 1 FROM admins WHERE admin_id=?", (uid,)).fetchone() is not None
 
-
 def is_root(user_id):
     return bool(ROOT_ADMIN_ID) and str(user_id) == ROOT_ADMIN_ID
-
 
 def register_user(user):
     if not user:
@@ -208,18 +216,15 @@ def register_user(user):
             first_name=excluded.first_name,last_seen=CURRENT_TIMESTAMP""",
             (str(user.id), user.username or "", user.first_name or ""))
 
-
 def get_node(node_id):
     with db() as conn:
         return conn.execute("SELECT * FROM menu_nodes WHERE id=?", (node_id,)).fetchone()
-
 
 def get_children(parent_id=None):
     with db() as conn:
         if parent_id is None:
             return conn.execute("SELECT * FROM menu_nodes WHERE parent_id IS NULL ORDER BY sort_order,id").fetchall()
         return conn.execute("SELECT * FROM menu_nodes WHERE parent_id=? ORDER BY sort_order,id", (parent_id,)).fetchall()
-
 
 def breadcrumb(node_id):
     parts = []
@@ -234,7 +239,6 @@ def breadcrumb(node_id):
             safety += 1
     return " / ".join(reversed(parts))
 
-
 def student_keyboard(parent_id=None):
     nodes = get_children(parent_id)
     keyboard = [[KeyboardButton(n["name"])] for n in nodes]
@@ -243,12 +247,13 @@ def student_keyboard(parent_id=None):
     keyboard.append([KeyboardButton("🏠 القائمة الرئيسية")])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-
 def admin_only(update: Update):
     user = update.effective_user
     return bool(user and is_admin(user.id))
 
-
+# ------------------------------------------------------------
+# أوامر ومعالجات البوت
+# ------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user:
         register_user(update.effective_user)
@@ -258,10 +263,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=student_keyboard(None),
     )
 
-
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(f"الآيدي الخاص بك: {update.effective_user.id}")
-
+    await update.effective_message.reply_text(f"الآيدي الخاص بك: `{update.effective_user.id}`", parse_mode="Markdown")
 
 async def show_node(update: Update, context: ContextTypes.DEFAULT_TYPE, node):
     node_id = node["id"]
@@ -308,7 +311,6 @@ async def show_node(update: Update, context: ContextTypes.DEFAULT_TYPE, node):
             reply_markup=student_keyboard(node_id),
         )
 
-
 async def student_text_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -333,14 +335,12 @@ async def student_text_navigation(update: Update, context: ContextTypes.DEFAULT_
             await show_node(update, context, parent)
         return
 
-    # حل الاسم في المستوى الحالي أولًا لتقليل الالتباس بين الأسماء المتكررة.
     matches = [n for n in get_children(current_id) if n["name"] == text]
     if not matches and current_id is not None:
         matches = [n for n in get_children(None) if n["name"] == text]
     if not matches:
         return
     await show_node(update, context, matches[0])
-
 
 # -------------------------- لوحة الإدارة --------------------------
 def admin_home_keyboard():
@@ -353,7 +353,6 @@ def admin_home_keyboard():
         [InlineKeyboardButton("🏠 القائمة الرئيسية للطلاب", callback_data="a:studenthome")],
     ])
 
-
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not admin_only(update):
         await update.effective_message.reply_text("❌ غير مصرح لك باستخدام لوحة الإدارة.")
@@ -361,8 +360,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop(PENDING_KEY, None)
     await update.effective_message.reply_text("🔐 لوحة إدارة المكتبة\nاختر العملية المطلوبة:", reply_markup=admin_home_keyboard())
 
-
-def node_list_keyboard(parent_id=None, admin_view=True):
+def node_list_keyboard(parent_id=None):
     nodes = get_children(parent_id)
     rows = []
     for n in nodes:
@@ -373,7 +371,6 @@ def node_list_keyboard(parent_id=None, admin_view=True):
     rows.append([InlineKeyboardButton("➕ إضافة زر رئيسي", callback_data="a:addroot")])
     rows.append([InlineKeyboardButton("🔙 لوحة الإدارة", callback_data="a:home")])
     return InlineKeyboardMarkup(rows)
-
 
 async def edit_node_screen(query, node_id):
     node = get_node(node_id)
@@ -398,11 +395,9 @@ async def edit_node_screen(query, node_id):
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
-
 async def ask_text(update, context, prompt, pending):
     context.user_data[PENDING_KEY] = pending
     await update.callback_query.edit_message_text(prompt + "\n\nأرسل /cancel للإلغاء.")
-
 
 async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -573,9 +568,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data[PENDING_KEY] = {"op": "broadcast"}
         await q.edit_message_text("أرسل رسالة الإذاعة. ستُرسل كنص عادي دون تفسير Markdown.\n\nأرسل /cancel للإلغاء.")
 
-
 def is_descendant(candidate_id, ancestor_id):
-    """True if candidate is nested under ancestor."""
     with db() as conn:
         row = conn.execute("SELECT parent_id FROM menu_nodes WHERE id=?", (candidate_id,)).fetchone()
         safety = 0
@@ -586,11 +579,9 @@ def is_descendant(candidate_id, ancestor_id):
             safety += 1
     return False
 
-
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop(PENDING_KEY, None)
     await update.effective_message.reply_text("تم إلغاء العملية.")
-
 
 async def admin_pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending = context.user_data.get(PENDING_KEY)
@@ -695,47 +686,51 @@ async def admin_pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE
                 log.exception("Broadcast failed for user %s", uid)
         await message.reply_text(f"انتهت الإذاعة.\n✅ تم الإرسال: {sent}\n⚠️ تعذر الإرسال: {blocked + max(0, len(users)-sent-blocked)}")
 
-
 async def admin_pending_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending = context.user_data.get(PENDING_KEY)
     if pending and pending.get("op") == "add_content_value":
         await admin_pending_input(update, context)
-    # تجاهل الملفات غير المطلوبة عندما لا توجد عملية إدارية معلقة.
-
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Unhandled exception while processing update", exc_info=context.error)
 
-
+# ------------------------------------------------------------
+# نقطة البدء الرئيسية لدعم منصة Render
+# ------------------------------------------------------------
 async def main():
     if not TOKEN:
         raise RuntimeError("ضع توكن البوت في متغير البيئة BOT_TOKEN.")
     if not ROOT_ADMIN_ID or not ROOT_ADMIN_ID.isdigit():
         raise RuntimeError("ضع ID الرقمي للأدمن الرئيسي في متغير البيئة ADMIN_ID.")
+    
+    # 1. تهيئة قاعدة البيانات
     init_db()
+
+    # 2. تشغيل سيرفر الويب المصغر لمنع وضع خمول Render
+    await start_web_server()
+
+    # 3. إعداد وتطبيق البوت
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("id", id_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
-    # Callback عام للأزرار الإدارية؛ يتحقق من صلاحية المستخدم داخل كل طلب.
     app.add_handler(CallbackQueryHandler(admin_callbacks, pattern=r"^a:"))
-    # الرسائل النصية أولًا: إذا كان هناك إدخال أدمن معلق يُعالَج هنا، وإلا تُعامل كتنقل للطالب.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_pending_input))
-    # الملفات والصور والفيديوهات تُستخدم لإضافة محتوى عند وجود عملية معلقة.
     app.add_handler(MessageHandler(filters.Document.ALL | filters.VIDEO | filters.PHOTO, admin_pending_media))
     app.add_error_handler(error_handler)
-    log.info("Starting bot")
+
+    log.info("Starting Cyber Library bot on Render...")
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=False)
+
     try:
         await asyncio.Event().wait()
     finally:
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
