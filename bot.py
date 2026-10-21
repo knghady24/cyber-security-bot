@@ -384,6 +384,7 @@ async def edit_node_screen(query, node_id):
         [InlineKeyboardButton("🧭 تغيير نوع الزر", callback_data=f"a:type:{node_id}")],
         [InlineKeyboardButton("🔗 تعيين رابط", callback_data=f"a:setlink:{node_id}")],
         [InlineKeyboardButton("📝 تعيين نص عند الفتح", callback_data=f"a:settext:{node_id}")],
+        [InlineKeyboardButton("📂 عرض الأزرار الفرعية", callback_data=f"a:nodes:{node_id}")], # <-- تم إضافة هذا الزر لحل المشكلة الأولى
         [InlineKeyboardButton("➕ إضافة زر فرعي", callback_data=f"a:addchild:{node_id}")],
         [InlineKeyboardButton("📎 إضافة محتوى", callback_data=f"a:addcontent:{node_id}")],
         [InlineKeyboardButton("📚 إدارة محتويات الزر", callback_data=f"a:contents:{node_id}")],
@@ -417,6 +418,14 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "studenthome":
         context.user_data.pop("current_node_id", None)
         await q.edit_message_text("القائمة الرئيسية للطلاب تظهر من أمر /start.\n\nلوحة الإدارة:", reply_markup=admin_home_keyboard())
+    elif action == "contentroot": # <-- تم إضافة معالج ل زر إدارة المحتوى (المشكلة الثانية)
+        await q.edit_message_text(
+            "📎 إدارة المحتوى:\n\nلإضافة أو تعديل محتويات أي قسم أو مادة (ملازم، فيديوهات، روابط)، اذهب إلى:\n🧩 إدارة جميع الأزرار -> اختر القسم المطلوب -> ثم اختر 'إضافة محتوى' أو 'إدارة محتويات الزر'.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🧩 الذهاب لإدارة الأزرار", callback_data="a:nodes:0")],
+                [InlineKeyboardButton("🔙 لوحة الإدارة", callback_data="a:home")]
+            ])
+        )
     elif action == "nodes":
         parent_id = int(parts[2]) if len(parts) > 2 else 0
         actual_parent = parent_id or None
