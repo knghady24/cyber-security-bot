@@ -216,7 +216,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⏳ *خلف هذه الواجهة ساعات طويلة من التفكير، البرمجة، والتعب المستمر لتخرج الخدمة بهذا الشكل المشرف.. كل ما أرجوه منكم هو دعوة صادقة بظهر الغيب أن يوفقني الله ويسر أمري.* 🤲🤍\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "🏠 **لوحة التحكم الرئيسية**\n"
-        "اختر القسم المطلوبة من الأزرار أدناه 👇"
+        "اختر القسم المطلوب من الأزرار أدناه 👇"
     )
     
     await update.effective_message.reply_text(
@@ -385,6 +385,10 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = data.split(":")
     action = parts[1] if len(parts) > 1 else ""
 
+    # مسح حالة الإدخال السريع المعلقة عند التنقل بالأزرار
+    if action in ["home", "nodes", "node", "studenthome", "contentroot"]:
+        context.user_data.pop(PENDING_KEY, None)
+
     if action == "home":
         context.user_data.pop(PENDING_KEY, None)
         await q.edit_message_text("🔐 **لوحة التحكم الإدارية المركزية**", parse_mode="Markdown", reply_markup=admin_home_keyboard())
@@ -435,13 +439,13 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "node":
         await edit_node_screen(q, int(parts[2]))
     elif action == "addroot":
-        await ask_text(update, context, "➕ **أدخل اسم الزر الرئيسي الجديد:**", {"op": "add_node", "parent_id": None})
+        await ask_text(update, context, "➕ **أدخل اسم الزر الرئيسي الجديد:**\n*(يمكنك إرسال عدة أزرار واحد تلو الآخر)*", {"op": "add_node", "parent_id": None})
     elif action == "addchild":
         parent_id = int(parts[2])
         if not get_node(parent_id):
             await q.edit_message_text("⚠️ القسم الأب غير موجود.", reply_markup=admin_home_keyboard())
             return
-        await ask_text(update, context, f"➕ **أدخل اسم الفرع الجديد داخل:**\n`{breadcrumb(parent_id)}`", {"op": "add_node", "parent_id": parent_id})
+        await ask_text(update, context, f"➕ **أدخل اسم الفرع أو المادة داخل:**\n`{breadcrumb(parent_id)}`\n\n⚡ *(وضع الإضافة السريعة مفعل: أرسل الأسماء تباعاً)*", {"op": "add_node", "parent_id": parent_id})
     elif action == "rename":
         node_id = int(parts[2])
         node = get_node(node_id)
@@ -643,8 +647,24 @@ async def admin_pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute("INSERT INTO menu_nodes(parent_id,name,action_type) VALUES(%s,%s, 'section')", (parent_id, text))
-        context.user_data.pop(PENDING_KEY, None)
-        await message.reply_text(f"✅ **تم إضافة الزر بنجاح:** `{text}`\nيمكنك إدارته عبر لوحة التحكم.", parse_mode="Markdown")
+        
+        # لا نقوم بحذف PENDING_KEY هنا، لكي تستطيع إضافة زر أو مادة أخرى تالية مباشرة بدون تعب!
+        parent_name = "القائمة الرئيسية" if parent_id is None else breadcrumb(parent_id)
+        
+        kb = []
+        if parent_id is not None:
+            kb.append([InlineKeyboardButton("🔙 إنهاء والعودة لإدارة الزر", callback_data=f"a:node:{parent_id}")])
+        else:
+            kb.append([InlineKeyboardButton("🔙 إنهاء والعودة لوحة التحكم", callback_data="a:home")])
+            
+        await message.reply_text(
+            f"✅ **تم إضافة:** `{text}` بنجاح!\n\n"
+            f"⚡ **وضع الإضافة السريعة مفعل:** أرسل اسم الزر أو المادة التالية مباشرة لإضافتها إلى ({parent_name})، أو اضغط زر الإنهاء أدناه عند الانتهاء:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+        return
+
     elif op == "rename":
         if not text:
             await message.reply_text("⚠️ الاسم لا يمكن أن يكون فارغاً.")
@@ -654,7 +674,12 @@ async def admin_pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             with conn.cursor() as cur:
                 cur.execute("UPDATE menu_nodes SET name=%s WHERE id=%s", (text, node_id))
         context.user_data.pop(PENDING_KEY, None)
-        await message.reply_text(f"✅ **تم تعديل اسم الزر إلى:** `{text}`", parse_mode="Markdown")
+        await message.reply_text(
+            f"✅ **تم تعديل اسم الزر إلى:** `{text}`", 
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 العودة لإدارة الزر", callback_data=f"a:node:{node_id}")]])
+        )
+
     elif op == "set_value":
         node_id, kind = pending["node_id"], pending["type"]
         if kind == "link" and not (text.startswith("https://") or text.startswith("http://")):
@@ -664,7 +689,12 @@ async def admin_pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             with conn.cursor() as cur:
                 cur.execute("UPDATE menu_nodes SET action_type=%s, action_value=%s WHERE id=%s", (kind, text, node_id))
         context.user_data.pop(PENDING_KEY, None)
-        await message.reply_text("✅ **تم تحديث بيانات الزر بنجاح.**", parse_mode="Markdown")
+        await message.reply_text(
+            "✅ **تم تحديث بيانات الزر بنجاح.**", 
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 العودة لإدارة الزر", callback_data=f"a:node:{node_id}")]])
+        )
+
     elif op == "add_content_title":
         if not text:
             await message.reply_text("⚠️ العنوان لا يمكن أن يكون فارغاً.")
@@ -681,6 +711,7 @@ async def admin_pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             "text": "📝 أرسل النص المراد حفظه الآن:"
         }
         await message.reply_text(prompts.get(kind, "أرسل المحتوى الآن:"))
+
     elif op == "add_content_value":
         kind, title, node_id = pending["type"], pending["title"], pending["node_id"]
         value = None
@@ -702,7 +733,15 @@ async def admin_pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             with conn.cursor() as cur:
                 cur.execute("INSERT INTO node_contents(node_id,content_type,title,value) VALUES(%s,%s,%s,%s)", (node_id, kind, title, value))
         context.user_data.pop(PENDING_KEY, None)
-        await message.reply_text("✅ **تم حفظ وحفظ المرفق بنجاح.**", parse_mode="Markdown")
+        await message.reply_text(
+            "✅ **تم حفظ المرفق بنجاح.**", 
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ إضافة محتوى آخر لهذا الزر", callback_data=f"a:addcontent:{node_id}")],
+                [InlineKeyboardButton("🔙 العودة لإدارة الزر", callback_data=f"a:node:{node_id}")]
+            ])
+        )
+
     elif op == "add_admin":
         if not is_root(update.effective_user.id):
             context.user_data.pop(PENDING_KEY, None)
@@ -719,6 +758,7 @@ async def admin_pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE
                 cur.execute("INSERT INTO admins(admin_id,added_by) VALUES(%s,%s) ON CONFLICT (admin_id) DO NOTHING", (text, str(update.effective_user.id)))
         context.user_data.pop(PENDING_KEY, None)
         await message.reply_text(f"✅ **تمت ترقية وتسجيل المشرف بنجاح:** `{text}`", parse_mode="Markdown")
+
     elif op == "broadcast":
         context.user_data.pop(PENDING_KEY, None)
         with db() as conn:
@@ -775,7 +815,6 @@ async def main():
     await app.initialize()
     await app.start()
     
-    # التعديل المهم هنا: تم إضافة await قبل عملية start_polling
     await app.updater.start_polling(drop_pending_updates=False)
 
     try:
