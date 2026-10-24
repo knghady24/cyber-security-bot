@@ -340,7 +340,13 @@ def node_list_keyboard(parent_id=None):
         rows.append([InlineKeyboardButton(label[:60], callback_data=f"a:node:{n['id']}")])
     if parent_id is not None:
         rows.append([InlineKeyboardButton("➕ إضافة فرع داخل هذا القسم", callback_data=f"a:addchild:{parent_id}")])
-    rows.append([InlineKeyboardButton("➕ إضافة زر رئيسي جديد", callback_data="a:addroot")])
+        # زر العودة للقسم الأب الأعلى منه خطوة واحدة
+        parent_node = get_node(parent_id)
+        grandparent_id = parent_node["parent_id"] if parent_node else 0
+        rows.append([InlineKeyboardButton("⬅️ العودة للقسم الأعلى", callback_data=f"a:nodes:{grandparent_id or 0}")])
+    else:
+        rows.append([InlineKeyboardButton("➕ إضافة زر رئيسي جديد", callback_data="a:addroot")])
+    
     rows.append([InlineKeyboardButton("🔙 لوحة التحكم الإدارية", callback_data="a:home")])
     return InlineKeyboardMarkup(rows)
 
@@ -361,7 +367,7 @@ async def edit_node_screen(query, node_id):
         [InlineKeyboardButton("📎 إضافة محتوى مرفق", callback_data=f"a:addcontent:{node_id}")],
         [InlineKeyboardButton("📚 إدارة محتويات الزر", callback_data=f"a:contents:{node_id}")],
         [InlineKeyboardButton("🗑️ حذف هذا الزر بالكامل", callback_data=f"a:delete:{node_id}")],
-        [InlineKeyboardButton("🔙 العودة للقائمة", callback_data=f"a:nodes:{node['parent_id'] or 0}")],
+        [InlineKeyboardButton("⬅️ العودة للقسم السابق", callback_data=f"a:nodes:{node['parent_id'] or 0}")],
     ]
     await query.edit_message_text(
         f"🧩 **إدارة خصائص الزر**\n\n• **الاسم:** {node['name']}\n• **المسار:** `{parent_text}`\n• **النوع:** `{node['action_type']}`\n\nاختر التعديل المطلوب:",
@@ -385,7 +391,6 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = data.split(":")
     action = parts[1] if len(parts) > 1 else ""
 
-    # مسح حالة الإدخال السريع المعلقة عند التنقل بالأزرار
     if action in ["home", "nodes", "node", "studenthome", "contentroot"]:
         context.user_data.pop(PENDING_KEY, None)
 
@@ -648,12 +653,12 @@ async def admin_pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             with conn.cursor() as cur:
                 cur.execute("INSERT INTO menu_nodes(parent_id,name,action_type) VALUES(%s,%s, 'section')", (parent_id, text))
         
-        # لا نقوم بحذف PENDING_KEY هنا، لكي تستطيع إضافة زر أو مادة أخرى تالية مباشرة بدون تعب!
         parent_name = "القائمة الرئيسية" if parent_id is None else breadcrumb(parent_id)
         
         kb = []
         if parent_id is not None:
             kb.append([InlineKeyboardButton("🔙 إنهاء والعودة لإدارة الزر", callback_data=f"a:node:{parent_id}")])
+            kb.append([InlineKeyboardButton("⬅️ العودة للقسم الأعلى", callback_data=f"a:nodes:{parent_id}")])
         else:
             kb.append([InlineKeyboardButton("🔙 إنهاء والعودة لوحة التحكم", callback_data="a:home")])
             
